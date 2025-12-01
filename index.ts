@@ -1,12 +1,13 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.7.0 (Aggressive Filter)
+ * Version: 2.8.0 (Precision Stream)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v2.7]
- * - Fix: Cắt bỏ hoàn toàn các dòng chứa "✩" hoặc "âœ©" (Suggestion stars).
- * - Fix: Dừng stream ngay khi phát hiện dấu hiệu kết thúc câu trả lời chính.
+ * [Changelog v2.8]
+ * - Parser: Chuyển sang dùng slice() thay vì regex để xử lý chính xác tuyệt đối khoảng trắng.
+ * - Logic: Xử lý tốt các token vụn (fragmented tokens) như "data:  a".
+ * - Feature: Tự động ngắt stream ngay khi gặp [ANSWER_DONE] (Bỏ qua phần Suggestion).
  * =================================================================================
  */
 
@@ -76,7 +77,7 @@ async function createSession(title = "Chat") {
   } catch (e) { console.error("Session Error:", e); throw e; }
 }
 
-// --- [FIXED STREAM PROCESSOR] ---
+// --- [CORE LOGIC: PRECISION PARSER] ---
 
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
@@ -97,33 +98,42 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
+        // [FIX 1] Xử lý prefix chính xác để giữ khoảng trắng
+        let dataStr = "";
         
-        let dataStr = line.replace(/^data:\s?/, "");
+        // Trường hợp phổ biến: "data: content" (có 1 dấu cách) -> Cắt 6 ký tự đầu
+        if (line.startsWith("data: ")) {
+            dataStr = line.slice(6);
+        } 
+        // Trường hợp ít gặp: "data:content" (không cách) -> Cắt 5 ký tự đầu
+        else if (line.startsWith("data:")) {
+            dataStr = line.slice(5);
+        } 
+        else {
+            continue; // Bỏ qua dòng không phải data
+        }
+
         if (dataStr.endsWith("\r")) dataStr = dataStr.slice(0, -1);
         
         const tagCheck = dataStr.trim();
 
-        // [AGRESSIVE FILTER]
-        // 1. Nếu gặp thẻ báo hiệu kết thúc câu trả lời chính
+        // [FIX 2] Ngắt ngay khi gặp [ANSWER_DONE] -> Bỏ qua toàn bộ phần gợi ý phía sau
         if (tagCheck === "[ANSWER_DONE]") break;
-        
-        // 2. Nếu gặp thẻ bắt đầu phần gợi ý
         if (tagCheck.startsWith("[RELATE_Q")) break;
 
-        // 3. Nếu nội dung chứa ký tự ngôi sao gợi ý (Dấu hiệu của phần Suggestion)
-        // Đây là fix quan trọng cho lỗi của bạn
-        if (dataStr.includes("✩") || dataStr.includes("âœ©")) break;
-
-        // DeepSeek Logic
+        // Tags điều khiển
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
         if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
         if (tagCheck === "[ANSWER_START]") continue;
 
-        // Smart Formatting
+        // [FIX 3] Smart Formatting (Xuống dòng thông minh cho danh sách/code)
+        // Log của bạn tách rất vụn: "data: 1", "data: ."
+        // Logic này giúp ghép lại nhưng vẫn đảm bảo xuống dòng khi bắt đầu mục mới
         const cleanStart = dataStr.trimStart();
-        const isBlockStart = /^(?:- |\* |\d+\. |### |Step \d)/.test(cleanStart);
+        // Regex bắt: Gạch đầu dòng, Số thứ tự (1.), Header (###), Code block (```)
+        const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
 
+        // Chỉ thêm \n nếu chunk trước đó không kết thúc bằng \n
         if (!isReasoning && isBlockStart && lastChar && !lastChar.endsWith("\n")) {
              dataStr = "\n" + dataStr;
         }
@@ -147,7 +157,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       }
       
       // Kiểm tra buffer tổng để break sớm nếu tag bị chia cắt giữa các chunks
-      if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q") || buffer.includes("✩")) break;
+      if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q")) break;
     }
     yield `data: [DONE]\n\n`;
   } catch (e) {
@@ -170,6 +180,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
   
+  // Model Mapping Logic
   let upstreamModel = CONFIG.MODEL_MAP[requestModel];
   if (!upstreamModel) {
       if (requestModel.includes("/")) upstreamModel = requestModel;
@@ -242,7 +253,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [SERVER] ---
-console.log(`🚀 Heck-2API (Bun) v2.7 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v2.8 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
