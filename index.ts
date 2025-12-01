@@ -1,12 +1,11 @@
 /**
  * =================================================================================
  * Project: Heck-2API (Bun Edition)
- * Version: 1.4.0 (Raw Stream Fix)
- * Logic:
- * - Parse raw text lines (not JSON)
- * - "data: " -> "\n" (Empty line = Newline)
- * - "data:  Word" -> " Word" (Keep leading space)
- * - STOP at [ANSWER_DONE] to remove "Related Questions"
+ * Version: 1.5.0 (Crash Fix)
+ * Fixes:
+ * - [x] "lastUserMsg.substring is not a function" (Handle Multimodal/Array content)
+ * - [x] Safe string handling for all message types
+ * - [x] Previous fixes (Spacing, Garbage removal, Line breaks)
  * =================================================================================
  */
 
@@ -53,6 +52,22 @@ Bun.serve({
   }
 });
 
+// --- Hàm xử lý nội dung tin nhắn an toàn ---
+function extractContent(content: any): string {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        // Xử lý trường hợp GPT-4 Vision (Array of content parts)
+        return content
+            .map(part => {
+                if (typeof part === 'string') return part;
+                if (part?.type === 'text') return part.text || "";
+                return ""; // Bỏ qua phần hình ảnh (image_url) vì API text không nhận
+            })
+            .join("\n");
+    }
+    return ""; // Fallback cho null/undefined
+}
+
 async function handleChatCompletions(req) {
   if (!verifyAuth(req)) return createErrorResponse("Unauthorized", 401);
 
@@ -64,17 +79,26 @@ async function handleChatCompletions(req) {
     let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
     
     let fullPrompt = "";
-    let lastUserMsg = "";
+    let lastUserMsg = ""; // Đảm bảo luôn là string
+
+    // --- LOOP FIX ---
     for (const msg of body.messages) {
-       if (msg.role === 'system') fullPrompt += `[System]: ${msg.content}\n`;
+       // Trích xuất text an toàn từ mọi loại msg
+       const cleanContent = extractContent(msg.content);
+       
+       if (msg.role === 'system') fullPrompt += `[System]: ${cleanContent}\n`;
        else if (msg.role === 'user') {
-           fullPrompt += `[User]: ${msg.content}\n`;
-           lastUserMsg = msg.content;
+           fullPrompt += `[User]: ${cleanContent}\n`;
+           lastUserMsg = cleanContent;
        }
-       else if (msg.role === 'assistant') fullPrompt += `[Assistant]: ${msg.content}\n`;
+       else if (msg.role === 'assistant') fullPrompt += `[Assistant]: ${cleanContent}\n`;
     }
 
-    const sessionTitle = (lastUserMsg.substring(0, 15) || "Chat").replace(/\n/g, " ");
+    // --- TITLE GENERATION SAFEGUARD ---
+    // Đảm bảo lastUserMsg là string và không rỗng trước khi gọi substring
+    const safeTitle = (lastUserMsg && typeof lastUserMsg === 'string') ? lastUserMsg : "New Chat";
+    const sessionTitle = (safeTitle.substring(0, 15) || "Chat").replace(/\n/g, " ");
+    
     const sessionId = await createSession(sessionTitle);
 
     const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
@@ -113,51 +137,25 @@ async function handleChatCompletions(req) {
           buffer = lines.pop() || "";
 
           for (const line of lines) {
-            // Loại bỏ ký tự \r thừa (nếu có) nhưng KHÔNG trim() khoảng trắng của nội dung
             let cleanLine = line.endsWith('\r') ? line.slice(0, -1) : line;
-            
-            // Chỉ xử lý dòng bắt đầu bằng "data:"
             if (!cleanLine.startsWith('data:')) continue;
             
-            // --- LOGIC PARSE QUAN TRỌNG ---
-            
-            // 1. Cắt bỏ chữ "data:" (5 ký tự)
             let temp = cleanLine.slice(5); 
-            
-            // 2. Nếu sau "data:" là dấu cách (SSE chuẩn), cắt bỏ 1 dấu cách đó.
-            // Ví dụ: "data:  Here" -> temp="  Here" -> content=" Here" (Giữ lại dấu cách của chữ)
-            // Ví dụ: "data:" -> temp="" -> content=""
             let content = "";
-            if (temp.startsWith(' ')) {
-                content = temp.slice(1);
-            } else {
-                content = temp;
-            }
+            if (temp.startsWith(' ')) content = temp.slice(1);
+            else content = temp;
 
-            // --- KIỂM TRA LỆNH ---
-            const command = content.trim(); // Bản trim dùng để check lệnh
-            
-            // Gặp [ANSWER_DONE] hoặc [RELATE_Q_START] là DỪNG NGAY -> Cắt bỏ phần gợi ý chat
+            const command = content.trim();
             if (command === '[ANSWER_DONE]' || command === '[RELATE_Q_START]') {
-                stopStream = true;
-                break;
+                stopStream = true; break;
             }
-
-            // Bỏ qua các tag không cần thiết
             if (command === '[DONE]' || command === '[ANSWER_START]') continue;
-            
-            // Logic DeepSeek R1 (Thinking)
             if (command === '[REASON_START]') { isReasoning = true; continue; }
             if (command === '[REASON_DONE]') { isReasoning = false; continue; }
             if (command.startsWith('{"error":')) continue;
 
-            // --- XỬ LÝ XUỐNG DÒNG ---
-            // Nếu content rỗng (do dòng "data: " hoặc "data:"), coi là xuống dòng
-            if (content.length === 0) {
-                content = "\n";
-            }
+            if (content.length === 0) content = "\n";
 
-            // --- GỬI CHUNK ---
             const chunk = createChunk(requestId, requestModel, content, null, isReasoning);
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
           }
@@ -173,6 +171,7 @@ async function handleChatCompletions(req) {
 
     return new Response(readable, { headers: corsHeaders({ 'Content-Type': 'text/event-stream' }) });
   } catch (e) {
+    console.error("Critical Error:", e);
     return createErrorResponse(e.message, 500);
   }
 }
