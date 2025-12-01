@@ -1,12 +1,12 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.6.0 (Clean Short Names)
+ * Version: 2.7.0 (Aggressive Filter)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v2.6]
- * - Model Map: Chỉ giữ lại tên ngắn (Short IDs) cho gọn gàng.
- * - Logic: Client gửi tên ngắn hay tên dài (upstream ID) đều chạy được.
+ * [Changelog v2.7]
+ * - Fix: Cắt bỏ hoàn toàn các dòng chứa "✩" hoặc "âœ©" (Suggestion stars).
+ * - Fix: Dừng stream ngay khi phát hiện dấu hiệu kết thúc câu trả lời chính.
  * =================================================================================
  */
 
@@ -27,8 +27,6 @@ const CONFIG = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   },
 
-  // Mapping: "Tên Ngắn" => "Upstream ID"
-  // API /v1/models sẽ chỉ trả về các keys ở đây (rất gọn)
   MODEL_MAP: {
     "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
     "deepseek-v3":      "deepseek/deepseek-chat",
@@ -43,8 +41,6 @@ const CONFIG = {
 
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
-
-// --- [Helpers] ---
 
 function corsHeaders() {
   return {
@@ -72,20 +68,15 @@ const extractText = (content: any): string => {
 async function createSession(title = "Chat") {
   try {
     const res = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
-      method: "POST",
-      headers: CONFIG.HEADERS,
-      body: JSON.stringify({ title }),
+      method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title }),
     });
     if (!res.ok) throw new Error(`Failed to create session: ${res.status}`);
     const data = await res.json() as any;
     return data.id;
-  } catch (e) {
-    console.error("Session Error:", e);
-    throw e;
-  }
+  } catch (e) { console.error("Session Error:", e); throw e; }
 }
 
-// --- [Core Logic: Stream Parser] ---
+// --- [FIXED STREAM PROCESSOR] ---
 
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
@@ -113,9 +104,17 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         
         const tagCheck = dataStr.trim();
 
-        // [No Suggestions]
-        if (tagCheck === "[ANSWER_DONE]" || tagCheck === "[RELATE_Q_START]") break;
+        // [AGRESSIVE FILTER]
+        // 1. Nếu gặp thẻ báo hiệu kết thúc câu trả lời chính
+        if (tagCheck === "[ANSWER_DONE]") break;
         
+        // 2. Nếu gặp thẻ bắt đầu phần gợi ý
+        if (tagCheck.startsWith("[RELATE_Q")) break;
+
+        // 3. Nếu nội dung chứa ký tự ngôi sao gợi ý (Dấu hiệu của phần Suggestion)
+        // Đây là fix quan trọng cho lỗi của bạn
+        if (dataStr.includes("✩") || dataStr.includes("âœ©")) break;
+
         // DeepSeek Logic
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
         if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
@@ -146,7 +145,9 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
-      if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q_START]")) break;
+      
+      // Kiểm tra buffer tổng để break sớm nếu tag bị chia cắt giữa các chunks
+      if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q") || buffer.includes("✩")) break;
     }
     yield `data: [DONE]\n\n`;
   } catch (e) {
@@ -160,7 +161,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
   }
 }
 
-// --- [Handlers] ---
+// --- [HANDLERS] ---
 
 async function handleChatCompletions(req: Request): Promise<Response> {
   let body: any;
@@ -169,18 +170,10 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
   
-  // Logic Map Model (Short Name -> Long Name)
   let upstreamModel = CONFIG.MODEL_MAP[requestModel];
-  
-  // Fallback: Nếu không tìm thấy trong Map
   if (!upstreamModel) {
-      // 1. Nếu client gửi sẵn tên dài (chứa dấu /), dùng luôn
-      if (requestModel.includes("/")) {
-          upstreamModel = requestModel;
-      } else {
-          // 2. Nếu tên lạ quá, về mặc định
-          upstreamModel = CONFIG.DEFAULT_MODEL;
-      }
+      if (requestModel.includes("/")) upstreamModel = requestModel;
+      else upstreamModel = CONFIG.DEFAULT_MODEL;
   }
 
   let fullPrompt = "";
@@ -248,8 +241,8 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   }
 }
 
-// --- [Server] ---
-console.log(`🚀 Heck-2API (Bun) v2.6 running on port ${CONFIG.PORT}`);
+// --- [SERVER] ---
+console.log(`🚀 Heck-2API (Bun) v2.7 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
