@@ -1,13 +1,14 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.8.0 (Precision Stream)
+ * Version: 2.9.0 (Reasoning Support)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v2.8]
- * - Parser: Chuyển sang dùng slice() thay vì regex để xử lý chính xác tuyệt đối khoảng trắng.
- * - Logic: Xử lý tốt các token vụn (fragmented tokens) như "data:  a".
- * - Feature: Tự động ngắt stream ngay khi gặp [ANSWER_DONE] (Bỏ qua phần Suggestion).
+ * [Changelog v2.9]
+ * - Feature: Hỗ trợ đầy đủ DeepSeek Reasoning (tách [REASON_START] -> reasoning_content).
+ * - Fix: Tự động bỏ qua thẻ [ANSWER_START] để không bị lặp chữ.
+ * - Fix: Tự động sửa lỗi font icon (ðŸ˜Š -> 😊).
+ * - Fix: Giữ nguyên logic cắt bỏ phần gợi ý (Suggestions).
  * =================================================================================
  */
 
@@ -28,6 +29,7 @@ const CONFIG = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   },
 
+  // Giữ lại danh sách model gọn gàng (v2.6)
   MODEL_MAP: {
     "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
     "deepseek-v3":      "deepseek/deepseek-chat",
@@ -77,7 +79,7 @@ async function createSession(title = "Chat") {
   } catch (e) { console.error("Session Error:", e); throw e; }
 }
 
-// --- [CORE LOGIC: PRECISION PARSER] ---
+// --- [CORE LOGIC: REASONING & STREAM PARSER] ---
 
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
@@ -85,7 +87,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
   const decoder = new TextDecoder();
   let buffer = "";
-  let isReasoning = false;
+  let isReasoning = false; // Trạng thái: Đang suy nghĩ hay đang trả lời
   let lastChar = ""; 
 
   try {
@@ -98,65 +100,85 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        // [FIX 1] Xử lý prefix chính xác để giữ khoảng trắng
+        // [PARSING] Cắt chuỗi chính xác để giữ khoảng trắng
         let dataStr = "";
-        
-        // Trường hợp phổ biến: "data: content" (có 1 dấu cách) -> Cắt 6 ký tự đầu
-        if (line.startsWith("data: ")) {
-            dataStr = line.slice(6);
-        } 
-        // Trường hợp ít gặp: "data:content" (không cách) -> Cắt 5 ký tự đầu
-        else if (line.startsWith("data:")) {
-            dataStr = line.slice(5);
-        } 
-        else {
-            continue; // Bỏ qua dòng không phải data
-        }
+        if (line.startsWith("data: ")) dataStr = line.slice(6);
+        else if (line.startsWith("data:")) dataStr = line.slice(5);
+        else continue;
 
         if (dataStr.endsWith("\r")) dataStr = dataStr.slice(0, -1);
         
         const tagCheck = dataStr.trim();
 
-        // [FIX 2] Ngắt ngay khi gặp [ANSWER_DONE] -> Bỏ qua toàn bộ phần gợi ý phía sau
+        // [CONTROL FLOW]
+        // 1. Dừng stream ngay khi xong câu trả lời (Bỏ qua gợi ý)
         if (tagCheck === "[ANSWER_DONE]") break;
         if (tagCheck.startsWith("[RELATE_Q")) break;
 
-        // Tags điều khiển
-        if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
-        if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
+        // 2. Chuyển đổi trạng thái Suy luận
+        if (tagCheck === "[REASON_START]") { 
+            isReasoning = true; 
+            continue; 
+        }
+        if (tagCheck === "[REASON_DONE]") { 
+            isReasoning = false; 
+            continue; 
+        }
+        
+        // 3. Bỏ qua thẻ bắt đầu trả lời (để không in ra text thừa)
         if (tagCheck === "[ANSWER_START]") continue;
 
-        // [FIX 3] Smart Formatting (Xuống dòng thông minh cho danh sách/code)
-        // Log của bạn tách rất vụn: "data: 1", "data: ."
-        // Logic này giúp ghép lại nhưng vẫn đảm bảo xuống dòng khi bắt đầu mục mới
+        // [TEXT CLEANUP]
+        // Fix lỗi font icon (Mojibake): ðŸ˜Š -> 😊
+        if (dataStr.includes("ðŸ˜Š")) dataStr = dataStr.replace(/ðŸ˜Š/g, "😊");
+        // Chặn các ký tự gợi ý nếu lọt lưới
+        if (dataStr.includes("âœ©") || dataStr.includes("✩")) break;
+
+        // [SMART FORMATTING]
+        // Logic xuống dòng thông minh cho các mục lục, code block
         const cleanStart = dataStr.trimStart();
-        // Regex bắt: Gạch đầu dòng, Số thứ tự (1.), Header (###), Code block (```)
         const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
 
-        // Chỉ thêm \n nếu chunk trước đó không kết thúc bằng \n
         if (!isReasoning && isBlockStart && lastChar && !lastChar.endsWith("\n")) {
              dataStr = "\n" + dataStr;
         }
 
         if (dataStr.length > 0) lastChar = dataStr;
 
+        // [OUTPUT GENERATION]
         let chunk: any = null;
+        
         if (isReasoning) {
+          // Output cho phần suy nghĩ (OpenAI Standard: reasoning_content)
           chunk = {
-            id: requestId, object: "chat.completion.chunk", created: Date.now()/1000|0, model: model,
-            choices: [{ index: 0, delta: { reasoning_content: dataStr }, finish_reason: null }]
+            id: requestId, 
+            object: "chat.completion.chunk", 
+            created: Math.floor(Date.now() / 1000), 
+            model: model,
+            choices: [{ 
+                index: 0, 
+                delta: { reasoning_content: dataStr }, // Quan trọng: Đẩy vào field này
+                finish_reason: null 
+            }]
           };
         } else {
+          // Output cho phần trả lời chính
           chunk = {
-            id: requestId, object: "chat.completion.chunk", created: Date.now()/1000|0, model: model,
-            choices: [{ index: 0, delta: { content: dataStr }, finish_reason: null }]
+            id: requestId, 
+            object: "chat.completion.chunk", 
+            created: Math.floor(Date.now() / 1000), 
+            model: model,
+            choices: [{ 
+                index: 0, 
+                delta: { content: dataStr }, 
+                finish_reason: null 
+            }]
           };
         }
 
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
       
-      // Kiểm tra buffer tổng để break sớm nếu tag bị chia cắt giữa các chunks
       if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q")) break;
     }
     yield `data: [DONE]\n\n`;
@@ -180,7 +202,6 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
   
-  // Model Mapping Logic
   let upstreamModel = CONFIG.MODEL_MAP[requestModel];
   if (!upstreamModel) {
       if (requestModel.includes("/")) upstreamModel = requestModel;
@@ -234,6 +255,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Connection": "keep-alive" }
     });
   } else {
+    // Non-stream handler (Aggregated)
     let fullContent = "";
     let fullReasoning = "";
     for await (const chunkStr of streamProcessor(upstreamRes, requestId, requestModel)) {
@@ -253,7 +275,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [SERVER] ---
-console.log(`🚀 Heck-2API (Bun) v2.8 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v2.9 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
