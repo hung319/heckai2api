@@ -1,28 +1,33 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 3.0.0 (Aggressive Formatting)
+ * Version: 3.1.0 (Stable & Safe Config)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v3.0]
- * - Formatter: Thêm hàm formatChunk() dùng Regex để cưỡng chế xuống dòng.
- * - Fix: Tự động tách Header (###) khi dính với văn bản.
- * - Fix: Tự động tách List (1. **, -) khi dính với văn bản.
- * - Fix: Tự động tách Code Block (```) khi dính với tiêu đề.
+ * [Changelog v3.1]
+ * - Fix: Lỗi "ERR_INVALID_URL" do biến môi trường bị rỗng hoặc format sai.
+ * - Core: Giữ nguyên logic Aggressive Formatting của v3.0.
  * =================================================================================
  */
 
 import { randomUUID } from "crypto";
 
+// --- [SAFE CONFIGURATION] ---
+const getEnv = (key: string, def: string) => {
+  const val = process.env[key];
+  return val ? val.trim().replace(/\/$/, "") : def;
+};
+
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000"),
-  API_KEY: process.env.API_MASTER_KEY || "1",
-  UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "[https://api.heckai.weight-wave.com/api/ha/v1](https://api.heckai.weight-wave.com/api/ha/v1)",
+  API_KEY: (process.env.API_MASTER_KEY || "1").trim(),
+  // Đảm bảo URL luôn hợp lệ và không có dấu / ở cuối
+  UPSTREAM_API_BASE: getEnv("UPSTREAM_API_BASE", "https://api.heckai.weight-wave.com/api/ha/v1"),
   
   HEADERS: {
     "Host": "api.heckai.weight-wave.com",
-    "Origin": "[https://heck.ai](https://heck.ai)",
-    "Referer": "[https://heck.ai/](https://heck.ai/)",
+    "Origin": "https://heck.ai",
+    "Referer": "https://heck.ai/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "Content-Type": "application/json",
     "Accept": "*/*",
@@ -68,35 +73,35 @@ const extractText = (content: any): string => {
 };
 
 async function createSession(title = "Chat") {
+  const targetUrl = `${CONFIG.UPSTREAM_API_BASE}/session/create`;
   try {
-    const res = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
+    // Debug log để kiểm tra URL nếu lỗi xảy ra
+    // console.log("Creating session at:", targetUrl); 
+
+    const res = await fetch(targetUrl, {
       method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title }),
     });
-    if (!res.ok) throw new Error(`Failed to create session: ${res.status}`);
+    
+    if (!res.ok) throw new Error(`Failed to create session [${res.status}]: ${res.statusText}`);
     const data = await res.json() as any;
     return data.id;
-  } catch (e) { console.error("Session Error:", e); throw e; }
+  } catch (e: any) { 
+    console.error(`[Session Error] URL: ${targetUrl} | Message: ${e.message}`); 
+    throw e; 
+  }
 }
 
-// --- [NEW HELPER: AGGRESSIVE FORMATTER] ---
-// Hàm này dùng Regex để chèn \n vào các chỗ bị dính
+// --- [AGGRESSIVE FORMATTER] ---
 function formatChunk(text: string): string {
   let formatted = text;
-
   // 1. Fix dính Header: "text###" -> "text\n\n###"
-  // Tìm ký tự không phải xuống dòng, theo sau là ###
   formatted = formatted.replace(/([^\n])\s?(###+\s)/g, "$1\n\n$2");
-
   // 2. Fix dính List số (đậm): "text1. **" -> "text\n\n1. **"
-  // Trường hợp trong log của bạn: "Structure1. **"
   formatted = formatted.replace(/([a-zA-Z0-9])\s?(\d+\.\s\*\*)/g, "$1\n\n$2");
-
   // 3. Fix dính List thường: "text- Item" -> "text\n\n- Item"
   formatted = formatted.replace(/([^\n])\s?(- \*\*|- [a-zA-Z])/g, "$1\n\n$2");
-
   // 4. Fix dính Code block: "text```" -> "text\n\n```"
   formatted = formatted.replace(/([^\n])\s?(```)/g, "$1\n\n$2");
-
   return formatted;
 }
 
@@ -121,7 +126,6 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        // Parsing
         let dataStr = "";
         if (line.startsWith("data: ")) dataStr = line.slice(6);
         else if (line.startsWith("data:")) dataStr = line.slice(5);
@@ -146,11 +150,8 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
         // --- [APPLY FORMATTING] ---
         if (!isReasoning) {
-            // 1. Chạy Regex formatter trên nội dung chunk hiện tại
             dataStr = formatChunk(dataStr);
 
-            // 2. Kiểm tra Boundary (giữa chunk trước và chunk này)
-            // Nếu chunk trước kết thúc bằng chữ, chunk này bắt đầu bằng Markdown -> Xuống dòng
             const cleanStart = dataStr.trimStart();
             const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
             
@@ -273,7 +274,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [SERVER] ---
-console.log(`🚀 Heck-2API (Bun) v3.0 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v3.1 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
