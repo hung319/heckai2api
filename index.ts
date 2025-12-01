@@ -1,12 +1,12 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.5.0 (Filtered Models Edition)
+ * Version: 2.6.0 (Clean Short Names)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v2.5]
- * - Model Map: Chỉ giữ lại danh sách model chỉ định (Gemini 2.5 Flash, GPT-5, Llama 4 Scout, v.v.).
- * - Core: Giữ nguyên logic v2.4 (Chặn gợi ý, Fix stream format).
+ * [Changelog v2.6]
+ * - Model Map: Chỉ giữ lại tên ngắn (Short IDs) cho gọn gàng.
+ * - Logic: Client gửi tên ngắn hay tên dài (upstream ID) đều chạy được.
  * =================================================================================
  */
 
@@ -27,45 +27,18 @@ const CONFIG = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   },
 
-  // Mapping: "Client Model ID" => "Heck Upstream ID"
-  // Hỗ trợ cả tên ngắn (vd: gpt-5-mini) và tên dài (vd: openai/gpt-5-mini)
+  // Mapping: "Tên Ngắn" => "Upstream ID"
+  // API /v1/models sẽ chỉ trả về các keys ở đây (rất gọn)
   MODEL_MAP: {
-    // 1. Gemini 2.5 Flash
     "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
-    "google/gemini-2.5-flash-preview": "google/gemini-2.5-flash-preview",
-
-    // 2. DeepSeek V3
-    "deepseek-v3": "deepseek/deepseek-chat",
-    "deepseek-chat": "deepseek/deepseek-chat",
-    "deepseek/deepseek-chat": "deepseek/deepseek-chat",
-
-    // 3. DeepSeek R1 Pro
-    "deepseek-r1": "deepseek/deepseek-r1",
-    "deepseek/deepseek-r1": "deepseek/deepseek-r1",
-
-    // 4. ChatGPT 4o mini
-    "gpt-4o-mini": "openai/gpt-4o-mini",
-    "openai/gpt-4o-mini": "openai/gpt-4o-mini",
-
-    // 5. ChatGPT-4.1 mini
-    "gpt-4.1-mini": "openai/gpt-4.1-mini",
-    "openai/gpt-4.1-mini": "openai/gpt-4.1-mini",
-
-    // 6. Grok 3 mini
-    "grok-3-mini": "x-ai/grok-3-mini-beta",
-    "x-ai/grok-3-mini-beta": "x-ai/grok-3-mini-beta",
-
-    // 7. Llama 4 Scout
-    "llama-4-scout": "meta-llama/llama-4-scout",
-    "meta-llama/llama-4-scout": "meta-llama/llama-4-scout",
-
-    // 8. GPT-5 Mini
-    "gpt-5-mini": "openai/gpt-5-mini",
-    "openai/gpt-5-mini": "openai/gpt-5-mini",
-
-    // 9. GPT-5 Nano
-    "gpt-5-nano": "openai/gpt-5-nano",
-    "openai/gpt-5-nano": "openai/gpt-5-nano",
+    "deepseek-v3":      "deepseek/deepseek-chat",
+    "deepseek-r1":      "deepseek/deepseek-r1",
+    "gpt-4o-mini":      "openai/gpt-4o-mini",
+    "gpt-4.1-mini":     "openai/gpt-4.1-mini",
+    "grok-3-mini":      "x-ai/grok-3-mini-beta",
+    "llama-4-scout":    "meta-llama/llama-4-scout",
+    "gpt-5-mini":       "openai/gpt-5-mini",
+    "gpt-5-nano":       "openai/gpt-5-nano",
   } as Record<string, string>,
 
   DEFAULT_MODEL: "openai/gpt-4o-mini"
@@ -140,7 +113,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         
         const tagCheck = dataStr.trim();
 
-        // Chặn gợi ý câu hỏi
+        // [No Suggestions]
         if (tagCheck === "[ANSWER_DONE]" || tagCheck === "[RELATE_Q_START]") break;
         
         // DeepSeek Logic
@@ -173,7 +146,6 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
-      // Break loop if suggestions found
       if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q_START]")) break;
     }
     yield `data: [DONE]\n\n`;
@@ -197,13 +169,18 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
   
-  // Logic Map Model
-  let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
-  // Fallback nếu model không có trong danh sách
-  if (!Object.values(CONFIG.MODEL_MAP).includes(upstreamModel) && !CONFIG.MODEL_MAP[requestModel]) {
-     if (!requestModel.includes("/")) {
-         upstreamModel = CONFIG.DEFAULT_MODEL;
-     }
+  // Logic Map Model (Short Name -> Long Name)
+  let upstreamModel = CONFIG.MODEL_MAP[requestModel];
+  
+  // Fallback: Nếu không tìm thấy trong Map
+  if (!upstreamModel) {
+      // 1. Nếu client gửi sẵn tên dài (chứa dấu /), dùng luôn
+      if (requestModel.includes("/")) {
+          upstreamModel = requestModel;
+      } else {
+          // 2. Nếu tên lạ quá, về mặc định
+          upstreamModel = CONFIG.DEFAULT_MODEL;
+      }
   }
 
   let fullPrompt = "";
@@ -272,7 +249,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [Server] ---
-console.log(`🚀 Heck-2API (Bun) v2.5 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v2.6 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
