@@ -1,15 +1,12 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.3.0 (Mega Models Update)
+ * Version: 2.5.0 (Filtered Models Edition)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v2.3]
- * - Added: Support for GPT-5 (Mini/Nano), GPT-4.1, O3, O4-Mini.
- * - Added: Support for Gemini 2.5 (Flash/Pro).
- * - Added: Support for Claude 3.7 Sonnet (Standard & Thinking).
- * - Added: Support for Llama 4 (Scout/Maverick) & Grok 3/4.
- * - Fix: Optimized stream processing for new model formats.
+ * [Changelog v2.5]
+ * - Model Map: Chỉ giữ lại danh sách model chỉ định (Gemini 2.5 Flash, GPT-5, Llama 4 Scout, v.v.).
+ * - Core: Giữ nguyên logic v2.4 (Chặn gợi ý, Fix stream format).
  * =================================================================================
  */
 
@@ -31,36 +28,44 @@ const CONFIG = {
   },
 
   // Mapping: "Client Model ID" => "Heck Upstream ID"
+  // Hỗ trợ cả tên ngắn (vd: gpt-5-mini) và tên dài (vd: openai/gpt-5-mini)
   MODEL_MAP: {
-    // --- OpenAI ---
-    "gpt-4o-mini": "openai/gpt-4o-mini",
-    "gpt-4o": "openai/chatgpt-4o-latest",
-    "gpt-4.1": "openai/gpt-4.1",
-    "gpt-4.1-mini": "openai/gpt-4.1-mini",
-    "gpt-5-mini": "openai/gpt-5-mini",
-    "gpt-5-nano": "openai/gpt-5-nano",
-    "o3": "openai/o3",
-    "o4-mini": "openai/o4-mini",
-    
-    // --- Google ---
+    // 1. Gemini 2.5 Flash
     "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
-    "gemini-2.5-pro": "google/gemini-2.5-pro-preview",
-    
-    // --- Anthropic ---
-    "claude-3.7-sonnet": "anthropic/claude-3.7-sonnet",
-    "claude-3.7-thinking": "anthropic/claude-3.7-sonnet:thinking", // Model suy luận
-    
-    // --- DeepSeek ---
-    "deepseek-r1": "deepseek/deepseek-r1",
+    "google/gemini-2.5-flash-preview": "google/gemini-2.5-flash-preview",
+
+    // 2. DeepSeek V3
     "deepseek-v3": "deepseek/deepseek-chat",
-    
-    // --- Meta (Llama) ---
-    "llama-4-scout": "meta-llama/llama-4-scout",
-    "llama-4-maverick": "meta-llama/llama-4-maverick",
-    
-    // --- xAI (Grok) ---
+    "deepseek-chat": "deepseek/deepseek-chat",
+    "deepseek/deepseek-chat": "deepseek/deepseek-chat",
+
+    // 3. DeepSeek R1 Pro
+    "deepseek-r1": "deepseek/deepseek-r1",
+    "deepseek/deepseek-r1": "deepseek/deepseek-r1",
+
+    // 4. ChatGPT 4o mini
+    "gpt-4o-mini": "openai/gpt-4o-mini",
+    "openai/gpt-4o-mini": "openai/gpt-4o-mini",
+
+    // 5. ChatGPT-4.1 mini
+    "gpt-4.1-mini": "openai/gpt-4.1-mini",
+    "openai/gpt-4.1-mini": "openai/gpt-4.1-mini",
+
+    // 6. Grok 3 mini
     "grok-3-mini": "x-ai/grok-3-mini-beta",
-    "grok-4": "x-ai/grok-4",
+    "x-ai/grok-3-mini-beta": "x-ai/grok-3-mini-beta",
+
+    // 7. Llama 4 Scout
+    "llama-4-scout": "meta-llama/llama-4-scout",
+    "meta-llama/llama-4-scout": "meta-llama/llama-4-scout",
+
+    // 8. GPT-5 Mini
+    "gpt-5-mini": "openai/gpt-5-mini",
+    "openai/gpt-5-mini": "openai/gpt-5-mini",
+
+    // 9. GPT-5 Nano
+    "gpt-5-nano": "openai/gpt-5-nano",
+    "openai/gpt-5-nano": "openai/gpt-5-nano",
   } as Record<string, string>,
 
   DEFAULT_MODEL: "openai/gpt-4o-mini"
@@ -131,26 +136,17 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         if (!line.startsWith("data:")) continue;
         
         let dataStr = line.replace(/^data:\s?/, "");
-
         if (dataStr.endsWith("\r")) dataStr = dataStr.slice(0, -1);
         
         const tagCheck = dataStr.trim();
 
-        if (tagCheck === "[ANSWER_DONE]") continue; 
-        if (tagCheck === "[RELATE_Q_DONE]") break;
+        // Chặn gợi ý câu hỏi
+        if (tagCheck === "[ANSWER_DONE]" || tagCheck === "[RELATE_Q_START]") break;
         
-        if (tagCheck === "[RELATE_Q_START]") {
-            dataStr = "\n\n---\n💡 **Gợi ý tiếp theo:**\n";
-        }
-        
+        // DeepSeek Logic
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
         if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
         if (tagCheck === "[ANSWER_START]") continue;
-
-        // Fix Mojibake
-        if (/âœ©|✩/.test(dataStr)) {
-            dataStr = dataStr.replace(/âœ©|✩/g, "\n👉 ");
-        }
 
         // Smart Formatting
         const cleanStart = dataStr.trimStart();
@@ -177,6 +173,8 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
+      // Break loop if suggestions found
+      if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q_START]")) break;
     }
     yield `data: [DONE]\n\n`;
   } catch (e) {
@@ -201,9 +199,8 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   
   // Logic Map Model
   let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
-  // Nếu model user yêu cầu không có trong map, thử dùng trực tiếp, nếu không thì fallback
+  // Fallback nếu model không có trong danh sách
   if (!Object.values(CONFIG.MODEL_MAP).includes(upstreamModel) && !CONFIG.MODEL_MAP[requestModel]) {
-     // Check nếu user gửi trực tiếp upstream ID (vd: openai/gpt-5-mini) thì cho qua
      if (!requestModel.includes("/")) {
          upstreamModel = CONFIG.DEFAULT_MODEL;
      }
@@ -275,7 +272,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [Server] ---
-console.log(`🚀 Heck-2API (Bun) v2.3 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v2.5 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
