@@ -1,14 +1,15 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.2.0 (Deep Log Analysis Fix)
+ * Version: 2.3.0 (Mega Models Update)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Fixes based on real logs]
- * 1. Space Preservation: Sử dụng regex /^data:\s?/ để giữ chính xác khoảng trắng nội dung.
- * 2. Extended Stream: Không ngắt stream ở [ANSWER_DONE] để lấy thêm phần gợi ý (Related Q).
- * 3. Icon Fix: Tự động thay thế ký tự lỗi âœ©/✩ thành icon dễ đọc.
- * 4. Smart Formatting: Tự động xuống dòng cho các list item (1., -) và Header.
+ * [Changelog v2.3]
+ * - Added: Support for GPT-5 (Mini/Nano), GPT-4.1, O3, O4-Mini.
+ * - Added: Support for Gemini 2.5 (Flash/Pro).
+ * - Added: Support for Claude 3.7 Sonnet (Standard & Thinking).
+ * - Added: Support for Llama 4 (Scout/Maverick) & Grok 3/4.
+ * - Fix: Optimized stream processing for new model formats.
  * =================================================================================
  */
 
@@ -29,13 +30,37 @@ const CONFIG = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   },
 
+  // Mapping: "Client Model ID" => "Heck Upstream ID"
   MODEL_MAP: {
+    // --- OpenAI ---
     "gpt-4o-mini": "openai/gpt-4o-mini",
     "gpt-4o": "openai/chatgpt-4o-latest",
+    "gpt-4.1": "openai/gpt-4.1",
+    "gpt-4.1-mini": "openai/gpt-4.1-mini",
+    "gpt-5-mini": "openai/gpt-5-mini",
+    "gpt-5-nano": "openai/gpt-5-nano",
+    "o3": "openai/o3",
+    "o4-mini": "openai/o4-mini",
+    
+    // --- Google ---
+    "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
+    "gemini-2.5-pro": "google/gemini-2.5-pro-preview",
+    
+    // --- Anthropic ---
+    "claude-3.7-sonnet": "anthropic/claude-3.7-sonnet",
+    "claude-3.7-thinking": "anthropic/claude-3.7-sonnet:thinking", // Model suy luận
+    
+    // --- DeepSeek ---
     "deepseek-r1": "deepseek/deepseek-r1",
     "deepseek-v3": "deepseek/deepseek-chat",
-    "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
-    "claude-3.7-sonnet": "anthropic/claude-3.7-sonnet",
+    
+    // --- Meta (Llama) ---
+    "llama-4-scout": "meta-llama/llama-4-scout",
+    "llama-4-maverick": "meta-llama/llama-4-maverick",
+    
+    // --- xAI (Grok) ---
+    "grok-3-mini": "x-ai/grok-3-mini-beta",
+    "grok-4": "x-ai/grok-4",
   } as Record<string, string>,
 
   DEFAULT_MODEL: "openai/gpt-4o-mini"
@@ -82,7 +107,7 @@ async function createSession(title = "Chat") {
   }
 }
 
-// --- [Core Logic: Stream Parser - Precision Fix] ---
+// --- [Core Logic: Stream Parser] ---
 
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
@@ -105,45 +130,29 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       for (const line of lines) {
         if (!line.startsWith("data:")) continue;
         
-        // [CRITICAL FIX 1] Cách cắt chuỗi an toàn nhất:
-        // Thay thế "data:" ở đầu và TỐI ĐA 1 dấu cách đi kèm.
-        // Ví dụ: "data:  again" -> " again" (Giữ lại 1 dấu cách nội dung)
-        // Ví dụ: "data:Hello"  -> "Hello" (Không mất chữ H)
         let dataStr = line.replace(/^data:\s?/, "");
 
-        // [FIX 2] Xử lý các ký tự điều khiển
         if (dataStr.endsWith("\r")) dataStr = dataStr.slice(0, -1);
         
-        // Kiểm tra Tags
         const tagCheck = dataStr.trim();
 
-        // Nếu gặp [ANSWER_DONE], ta KHÔNG break ngay mà chỉ bỏ qua,
-        // để chờ xem có phần [RELATE_Q] phía sau không.
         if (tagCheck === "[ANSWER_DONE]") continue; 
-        
-        // Nếu gặp [RELATE_Q_DONE] hoặc [DONE] chuẩn -> mới dừng hẳn
         if (tagCheck === "[RELATE_Q_DONE]") break;
         
         if (tagCheck === "[RELATE_Q_START]") {
-            // Thêm dòng ngăn cách cho đẹp
             dataStr = "\n\n---\n💡 **Gợi ý tiếp theo:**\n";
         }
         
-        // Logic DeepSeek R1
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
         if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
         if (tagCheck === "[ANSWER_START]") continue;
 
-        // [FIX 3] Thay thế ký tự lỗi font (Mojibake) và dấu sao
-        // âœ© là lỗi UTF-8 của ✩
+        // Fix Mojibake
         if (/âœ©|✩/.test(dataStr)) {
             dataStr = dataStr.replace(/âœ©|✩/g, "\n👉 ");
         }
 
-        // [FIX 4] Smart Formatting (Tự động xuống dòng)
-        // Nếu dòng mới bắt đầu bằng "1.", "- ", "###" mà dòng trước chưa xuống dòng
-        const isListOrHeader = /^(?:- |\* |\d+\. |### |Step \d)/.test(dataStr);
-        // Lưu ý: dataStr có thể bắt đầu bằng khoảng trắng (ví dụ " 1."), nên cần trimStart để check regex
+        // Smart Formatting
         const cleanStart = dataStr.trimStart();
         const isBlockStart = /^(?:- |\* |\d+\. |### |Step \d)/.test(cleanStart);
 
@@ -151,7 +160,6 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
              dataStr = "\n" + dataStr;
         }
 
-        // Tạo chunk trả về
         if (dataStr.length > 0) lastChar = dataStr;
 
         let chunk: any = null;
@@ -170,7 +178,6 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
     }
-    // Gửi tín hiệu kết thúc chuẩn OpenAI
     yield `data: [DONE]\n\n`;
   } catch (e) {
     console.error("Stream Error:", e);
@@ -192,9 +199,14 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
   
+  // Logic Map Model
   let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
+  // Nếu model user yêu cầu không có trong map, thử dùng trực tiếp, nếu không thì fallback
   if (!Object.values(CONFIG.MODEL_MAP).includes(upstreamModel) && !CONFIG.MODEL_MAP[requestModel]) {
-     upstreamModel = CONFIG.DEFAULT_MODEL;
+     // Check nếu user gửi trực tiếp upstream ID (vd: openai/gpt-5-mini) thì cho qua
+     if (!requestModel.includes("/")) {
+         upstreamModel = CONFIG.DEFAULT_MODEL;
+     }
   }
 
   let fullPrompt = "";
@@ -220,11 +232,10 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     return Response.json({ error: "Upstream session error" }, { status: 502 });
   }
 
-  // Payload chuẩn log
   const upstreamPayload = {
     model: upstreamModel,
     question: question,
-    language: "English", // Log của bạn dùng English
+    language: "English",
     sessionId: sessionId,
     previousQuestion: null,
     previousAnswer: null,
@@ -245,7 +256,6 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Connection": "keep-alive" }
     });
   } else {
-    // Non-stream accumulator
     let fullContent = "";
     let fullReasoning = "";
     for await (const chunkStr of streamProcessor(upstreamRes, requestId, requestModel)) {
@@ -265,7 +275,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [Server] ---
-console.log(`🚀 Heck-2API (Bun) v2.2 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v2.3 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
@@ -276,7 +286,8 @@ Bun.serve({
       return handleChatCompletions(req);
     }
     if (url.pathname === "/v1/models") {
-        return Response.json({ object: "list", data: [] }, { headers: corsHeaders() });
+        const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({ id, object: "model", created: Date.now(), owned_by: "heck-bun" }));
+        return Response.json({ object: "list", data: models }, { headers: corsHeaders() });
     }
     return Response.json({ error: "Not Found" }, { status: 404 });
   }
