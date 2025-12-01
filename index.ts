@@ -1,14 +1,13 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.0.0 (Bun Native)
+ * Version: 2.1.0 (Stable)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Tính năng]
- * 1. Bun Native Server (High Performance).
- * 2. Hỗ trợ chuẩn OpenAI (Stream & Non-Stream).
- * 3. Tự động xử lý Session nặc danh.
- * 4. Hỗ trợ DeepSeek Reasoning (reasoning_content).
+ * [Changelog]
+ * - Fix: Lỗi dính chữ do hàm trim() (Spaces preserved).
+ * - Fix: Lỗi crash khi content là array (Multimodal support).
+ * - Feat: Tự động format lại các gợi ý câu hỏi (✩).
  * =================================================================================
  */
 
@@ -56,10 +55,22 @@ function corsHeaders() {
 
 function verifyAuth(req: Request): boolean {
   const authHeader = req.headers.get("Authorization");
-  if (!authHeader) return CONFIG.API_KEY === "1"; // Nếu key là "1" thì mở công khai (dev mode)
+  if (!authHeader) return CONFIG.API_KEY === "1"; 
   const token = authHeader.replace("Bearer ", "").trim();
   return token === CONFIG.API_KEY;
 }
+
+// Trích xuất text an toàn từ message content (xử lý cả string và array)
+const extractText = (content: any): string => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join(" ");
+  }
+  return ""; // Fallback cho null/undefined
+};
 
 // Tạo Session mới từ Upstream
 async function createSession(title = "Chat") {
@@ -79,8 +90,11 @@ async function createSession(title = "Chat") {
   }
 }
 
-// --- [Core Logic: Stream Parser - Đã sửa lỗi dính chữ] ---
+// --- [Core Logic: Stream Parser] ---
 
+/**
+ * Generator xử lý stream từ Upstream và convert sang OpenAI Chunk format
+ */
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
   if (!reader) throw new Error("No response body from upstream");
@@ -99,32 +113,33 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        // Chỉ xử lý dòng bắt đầu bằng "data: "
         if (!line.startsWith("data: ")) continue;
         
-        // Lấy nội dung thô, chỉ cắt bỏ "data: " (6 ký tự)
-        // QUAN TRỌNG: Không dùng .trim() ở đây vì sẽ mất dấu cách đầu từ
+        // [FIX TRIMMING] Dùng slice(6) thay vì trim() để giữ khoảng trắng đầu câu
         let dataStr = line.slice(6);
-
-        // Loại bỏ ký tự \r nếu có (do split \n để lại)
+        
+        // [FIX NEWLINE] Loại bỏ ký tự \r do split để lại (nếu có)
         if (dataStr.endsWith("\r")) {
             dataStr = dataStr.slice(0, -1);
         }
 
-        // Kiểm tra các thẻ điều khiển (Cần trim tạm để so sánh chính xác)
+        // Kiểm tra tags (cần trim tạm để check)
         const tagCheck = dataStr.trim();
-        
+
+        // Bỏ qua các tag điều khiển
         if (["[ANSWER_DONE]", "[RELATE_Q_START]", "[RELATE_Q_DONE]", "[ANSWER_START]"].includes(tagCheck)) continue;
+        
+        // Logic suy luận (Reasoning)
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
         if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
         if (tagCheck === "[ERROR]") continue;
 
-        // Xử lý dấu sao (gợi ý câu hỏi) nếu có: Thay vì dính chùm, ta xuống dòng
+        // [FEATURE] Format dấu sao (gợi ý) thành xuống dòng
         if (dataStr.includes("✩")) {
             dataStr = dataStr.replace(/✩/g, "\n\n💡 Gợi ý: ");
         }
 
-        // Xử lý nội dung
+        // Tạo chunk OpenAI
         let chunk: any = null;
         
         if (isReasoning) {
@@ -148,6 +163,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
     }
+    // Kết thúc stream
     yield `data: [DONE]\n\n`;
   } catch (e) {
     console.error("Stream processing error:", e);
@@ -176,27 +192,37 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 
   const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
+  
   // Logic Map Model
   let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
   if (!Object.values(CONFIG.MODEL_MAP).includes(upstreamModel) && !CONFIG.MODEL_MAP[requestModel]) {
      upstreamModel = CONFIG.DEFAULT_MODEL;
   }
 
-  // Xử lý Messages -> Prompt (Heck dùng prompt text)
+  // [FIX CRASH] Dùng extractText thay vì lấy trực tiếp msg.content
   let fullPrompt = "";
   let lastUserMsg = "";
+  
   for (const msg of (body.messages || [])) {
-    if (msg.role === "system") fullPrompt += `[System]: ${msg.content}\n`;
-    else if (msg.role === "user") {
-      fullPrompt += `[User]: ${msg.content}\n`;
-      lastUserMsg = msg.content;
+    const contentStr = extractText(msg.content);
+
+    if (msg.role === "system") {
+      fullPrompt += `[System]: ${contentStr}\n`;
+    } else if (msg.role === "user") {
+      fullPrompt += `[User]: ${contentStr}\n`;
+      lastUserMsg = contentStr; // Đảm bảo luôn là string
+    } else if (msg.role === "assistant") {
+      fullPrompt += `[Assistant]: ${contentStr}\n`;
     }
-    else if (msg.role === "assistant") fullPrompt += `[Assistant]: ${msg.content}\n`;
   }
+  
   const question = fullPrompt.trim() || "Hello";
 
   // 1. Tạo Session ID (Anonymous)
-  const sessionTitle = lastUserMsg.substring(0, 10) || "Chat";
+  // [FIX CRASH] Đảm bảo biến title luôn là string an toàn
+  const safeTitle = (lastUserMsg || "Chat").toString();
+  const sessionTitle = safeTitle.substring(0, 10) || "Chat";
+  
   let sessionId;
   try {
     sessionId = await createSession(sessionTitle);
@@ -208,12 +234,12 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const upstreamPayload = {
     model: upstreamModel,
     question: question,
-    language: "Chinese", // Có thể chỉnh thành "English" hoặc "Vietnamese" tùy nhu cầu
+    language: "Chinese", // Mặc định ngôn ngữ
     sessionId: sessionId,
     previousQuestion: null,
     previousAnswer: null,
     imgUrls: [],
-    superSmartMode: false // Bật true nếu muốn ép chế độ suy nghĩ sâu
+    superSmartMode: false
   };
 
   const upstreamRes = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
@@ -226,7 +252,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     return Response.json({ error: { message: `Upstream error: ${upstreamRes.status}` } }, { status: upstreamRes.status });
   }
 
-  // 3. Xử lý phản hồi (Stream vs Non-Stream)
+  // 3. Xử lý phản hồi
   const isStream = body.stream === true;
 
   if (isStream) {
@@ -243,8 +269,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       }
     });
   } else {
-    // --- Non-Streaming Mode (Buffer toàn bộ) ---
-    // Chúng ta phải tiêu thụ streamProcessor để lấy toàn bộ text
+    // --- Non-Streaming Mode ---
     let fullContent = "";
     let fullReasoning = "";
     const stream = streamProcessor(upstreamRes, requestId, requestModel);
@@ -262,10 +287,9 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         if (chunk.choices[0].delta.reasoning_content) {
           fullReasoning += chunk.choices[0].delta.reasoning_content;
         }
-      } catch (e) { /* ignore parse error in chunks */ }
+      } catch (e) { /* ignore */ }
     }
 
-    // Cấu trúc JSON trả về chuẩn OpenAI Non-stream
     const responseBody = {
       id: requestId,
       object: "chat.completion",
@@ -276,12 +300,11 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         message: {
           role: "assistant",
           content: fullContent,
-          // Một số client hỗ trợ field này ở non-stream (không chuẩn hoàn toàn nhưng hữu ích)
           reasoning_content: fullReasoning || undefined 
         },
         finish_reason: "stop"
       }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } // Dummy usage
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     };
 
     return Response.json(responseBody, { headers: corsHeaders() });
@@ -297,18 +320,15 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    // CORS Preflight
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    // Route: /v1/chat/completions
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       if (!verifyAuth(req)) return Response.json({ error: "Unauthorized" }, { status: 401 });
       return handleChatCompletions(req);
     }
 
-    // Route: /v1/models
     if (url.pathname === "/v1/models" && req.method === "GET") {
       if (!verifyAuth(req)) return Response.json({ error: "Unauthorized" }, { status: 401 });
       const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({
@@ -317,7 +337,6 @@ Bun.serve({
       return Response.json({ object: "list", data: models }, { headers: corsHeaders() });
     }
 
-    // Default: 404
     return Response.json({ error: "Not Found" }, { status: 404 });
   }
 });
