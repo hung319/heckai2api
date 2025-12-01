@@ -79,11 +79,8 @@ async function createSession(title = "Chat") {
   }
 }
 
-// --- [Core Logic: Stream Parser] ---
+// --- [Core Logic: Stream Parser - Đã sửa lỗi dính chữ] ---
 
-/**
- * Generator xử lý stream từ Upstream và convert sang OpenAI Chunk format
- */
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
   if (!reader) throw new Error("No response body from upstream");
@@ -102,20 +99,35 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
+        // Chỉ xử lý dòng bắt đầu bằng "data: "
         if (!line.startsWith("data: ")) continue;
-        const dataStr = line.slice(6).trim();
+        
+        // Lấy nội dung thô, chỉ cắt bỏ "data: " (6 ký tự)
+        // QUAN TRỌNG: Không dùng .trim() ở đây vì sẽ mất dấu cách đầu từ
+        let dataStr = line.slice(6);
 
-        // Xử lý các thẻ điều khiển của Heck
-        if (["[ANSWER_DONE]", "[RELATE_Q_START]", "[RELATE_Q_DONE]", "[ANSWER_START]"].includes(dataStr)) continue;
-        if (dataStr === "[REASON_START]") { isReasoning = true; continue; }
-        if (dataStr === "[REASON_DONE]") { isReasoning = false; continue; }
-        if (dataStr === "[ERROR]") continue; // Dòng sau thường là JSON lỗi, bỏ qua đơn giản
+        // Loại bỏ ký tự \r nếu có (do split \n để lại)
+        if (dataStr.endsWith("\r")) {
+            dataStr = dataStr.slice(0, -1);
+        }
+
+        // Kiểm tra các thẻ điều khiển (Cần trim tạm để so sánh chính xác)
+        const tagCheck = dataStr.trim();
+        
+        if (["[ANSWER_DONE]", "[RELATE_Q_START]", "[RELATE_Q_DONE]", "[ANSWER_START]"].includes(tagCheck)) continue;
+        if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
+        if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
+        if (tagCheck === "[ERROR]") continue;
+
+        // Xử lý dấu sao (gợi ý câu hỏi) nếu có: Thay vì dính chùm, ta xuống dòng
+        if (dataStr.includes("✩")) {
+            dataStr = dataStr.replace(/✩/g, "\n\n💡 Gợi ý: ");
+        }
 
         // Xử lý nội dung
         let chunk: any = null;
         
         if (isReasoning) {
-          // Chunk suy luận (DeepSeek R1 style)
           chunk = {
             id: requestId,
             object: "chat.completion.chunk",
@@ -124,7 +136,6 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
             choices: [{ index: 0, delta: { reasoning_content: dataStr }, finish_reason: null }]
           };
         } else {
-          // Chunk nội dung chính
           chunk = {
             id: requestId,
             object: "chat.completion.chunk",
@@ -137,7 +148,6 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
     }
-    // Kết thúc stream
     yield `data: [DONE]\n\n`;
   } catch (e) {
     console.error("Stream processing error:", e);
