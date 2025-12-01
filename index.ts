@@ -1,14 +1,14 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 2.9.0 (Reasoning Support)
+ * Version: 3.0.0 (Aggressive Formatting)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v2.9]
- * - Feature: Hỗ trợ đầy đủ DeepSeek Reasoning (tách [REASON_START] -> reasoning_content).
- * - Fix: Tự động bỏ qua thẻ [ANSWER_START] để không bị lặp chữ.
- * - Fix: Tự động sửa lỗi font icon (ðŸ˜Š -> 😊).
- * - Fix: Giữ nguyên logic cắt bỏ phần gợi ý (Suggestions).
+ * [Changelog v3.0]
+ * - Formatter: Thêm hàm formatChunk() dùng Regex để cưỡng chế xuống dòng.
+ * - Fix: Tự động tách Header (###) khi dính với văn bản.
+ * - Fix: Tự động tách List (1. **, -) khi dính với văn bản.
+ * - Fix: Tự động tách Code Block (```) khi dính với tiêu đề.
  * =================================================================================
  */
 
@@ -17,19 +17,18 @@ import { randomUUID } from "crypto";
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000"),
   API_KEY: process.env.API_MASTER_KEY || "1",
-  UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "https://api.heckai.weight-wave.com/api/ha/v1",
+  UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "[https://api.heckai.weight-wave.com/api/ha/v1](https://api.heckai.weight-wave.com/api/ha/v1)",
   
   HEADERS: {
     "Host": "api.heckai.weight-wave.com",
-    "Origin": "https://heck.ai",
-    "Referer": "https://heck.ai/",
+    "Origin": "[https://heck.ai](https://heck.ai)",
+    "Referer": "[https://heck.ai/](https://heck.ai/)",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "Content-Type": "application/json",
     "Accept": "*/*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   },
 
-  // Giữ lại danh sách model gọn gàng (v2.6)
   MODEL_MAP: {
     "gemini-2.5-flash": "google/gemini-2.5-flash-preview",
     "deepseek-v3":      "deepseek/deepseek-chat",
@@ -79,7 +78,29 @@ async function createSession(title = "Chat") {
   } catch (e) { console.error("Session Error:", e); throw e; }
 }
 
-// --- [CORE LOGIC: REASONING & STREAM PARSER] ---
+// --- [NEW HELPER: AGGRESSIVE FORMATTER] ---
+// Hàm này dùng Regex để chèn \n vào các chỗ bị dính
+function formatChunk(text: string): string {
+  let formatted = text;
+
+  // 1. Fix dính Header: "text###" -> "text\n\n###"
+  // Tìm ký tự không phải xuống dòng, theo sau là ###
+  formatted = formatted.replace(/([^\n])\s?(###+\s)/g, "$1\n\n$2");
+
+  // 2. Fix dính List số (đậm): "text1. **" -> "text\n\n1. **"
+  // Trường hợp trong log của bạn: "Structure1. **"
+  formatted = formatted.replace(/([a-zA-Z0-9])\s?(\d+\.\s\*\*)/g, "$1\n\n$2");
+
+  // 3. Fix dính List thường: "text- Item" -> "text\n\n- Item"
+  formatted = formatted.replace(/([^\n])\s?(- \*\*|- [a-zA-Z])/g, "$1\n\n$2");
+
+  // 4. Fix dính Code block: "text```" -> "text\n\n```"
+  formatted = formatted.replace(/([^\n])\s?(```)/g, "$1\n\n$2");
+
+  return formatted;
+}
+
+// --- [CORE LOGIC] ---
 
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
@@ -87,7 +108,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
   const decoder = new TextDecoder();
   let buffer = "";
-  let isReasoning = false; // Trạng thái: Đang suy nghĩ hay đang trả lời
+  let isReasoning = false;
   let lastChar = ""; 
 
   try {
@@ -100,7 +121,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        // [PARSING] Cắt chuỗi chính xác để giữ khoảng trắng
+        // Parsing
         let dataStr = "";
         if (line.startsWith("data: ")) dataStr = line.slice(6);
         else if (line.startsWith("data:")) dataStr = line.slice(5);
@@ -110,69 +131,47 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         
         const tagCheck = dataStr.trim();
 
-        // [CONTROL FLOW]
-        // 1. Dừng stream ngay khi xong câu trả lời (Bỏ qua gợi ý)
+        // Filters (No Suggestions)
         if (tagCheck === "[ANSWER_DONE]") break;
         if (tagCheck.startsWith("[RELATE_Q")) break;
 
-        // 2. Chuyển đổi trạng thái Suy luận
-        if (tagCheck === "[REASON_START]") { 
-            isReasoning = true; 
-            continue; 
-        }
-        if (tagCheck === "[REASON_DONE]") { 
-            isReasoning = false; 
-            continue; 
-        }
-        
-        // 3. Bỏ qua thẻ bắt đầu trả lời (để không in ra text thừa)
+        // Reasoning Tags
+        if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
+        if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
         if (tagCheck === "[ANSWER_START]") continue;
 
-        // [TEXT CLEANUP]
-        // Fix lỗi font icon (Mojibake): ðŸ˜Š -> 😊
+        // Cleanup
         if (dataStr.includes("ðŸ˜Š")) dataStr = dataStr.replace(/ðŸ˜Š/g, "😊");
-        // Chặn các ký tự gợi ý nếu lọt lưới
         if (dataStr.includes("âœ©") || dataStr.includes("✩")) break;
 
-        // [SMART FORMATTING]
-        // Logic xuống dòng thông minh cho các mục lục, code block
-        const cleanStart = dataStr.trimStart();
-        const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
+        // --- [APPLY FORMATTING] ---
+        if (!isReasoning) {
+            // 1. Chạy Regex formatter trên nội dung chunk hiện tại
+            dataStr = formatChunk(dataStr);
 
-        if (!isReasoning && isBlockStart && lastChar && !lastChar.endsWith("\n")) {
-             dataStr = "\n" + dataStr;
+            // 2. Kiểm tra Boundary (giữa chunk trước và chunk này)
+            // Nếu chunk trước kết thúc bằng chữ, chunk này bắt đầu bằng Markdown -> Xuống dòng
+            const cleanStart = dataStr.trimStart();
+            const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
+            
+            if (isBlockStart && lastChar && !lastChar.endsWith("\n")) {
+                dataStr = "\n\n" + dataStr;
+            }
         }
 
         if (dataStr.length > 0) lastChar = dataStr;
 
-        // [OUTPUT GENERATION]
+        // Output
         let chunk: any = null;
-        
         if (isReasoning) {
-          // Output cho phần suy nghĩ (OpenAI Standard: reasoning_content)
           chunk = {
-            id: requestId, 
-            object: "chat.completion.chunk", 
-            created: Math.floor(Date.now() / 1000), 
-            model: model,
-            choices: [{ 
-                index: 0, 
-                delta: { reasoning_content: dataStr }, // Quan trọng: Đẩy vào field này
-                finish_reason: null 
-            }]
+            id: requestId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: model,
+            choices: [{ index: 0, delta: { reasoning_content: dataStr }, finish_reason: null }]
           };
         } else {
-          // Output cho phần trả lời chính
           chunk = {
-            id: requestId, 
-            object: "chat.completion.chunk", 
-            created: Math.floor(Date.now() / 1000), 
-            model: model,
-            choices: [{ 
-                index: 0, 
-                delta: { content: dataStr }, 
-                finish_reason: null 
-            }]
+            id: requestId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: model,
+            choices: [{ index: 0, delta: { content: dataStr }, finish_reason: null }]
           };
         }
 
@@ -255,7 +254,6 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Connection": "keep-alive" }
     });
   } else {
-    // Non-stream handler (Aggregated)
     let fullContent = "";
     let fullReasoning = "";
     for await (const chunkStr of streamProcessor(upstreamRes, requestId, requestModel)) {
@@ -275,7 +273,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [SERVER] ---
-console.log(`🚀 Heck-2API (Bun) v2.9 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v3.0 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
