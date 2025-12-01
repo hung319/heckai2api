@@ -1,38 +1,34 @@
 /**
  * =================================================================================
- * Project: heck-2api (Bun Edition)
- * Version: 1.0.0 (Ghost Session)
- * Runtime: Bun v1.x
+ * Project: Heck-2API (Bun Edition)
+ * Refactored based on: layout-f4c08c4df7990e01.js
+ * Features:
+ * - Bun Native Server
+ * - Auto .env loading
+ * - Exact Payload Matching
+ * - Chat Suggestion Removal ([RELATE_Q])
+ * - OpenAI Format Conversion with Deep Thinking support
  * =================================================================================
  */
 
-// --- [1. Configuration] ---
+// [1] Configuration
 const CONFIG = {
   PORT: process.env.PORT || 3000,
-  API_MASTER_KEY: process.env.API_MASTER_KEY || "1", // Set in .env
-  
-  // Upstream Configuration
+  API_MASTER_KEY: process.env.API_MASTER_KEY || "1",
   UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "https://api.heckai.weight-wave.com/api/ha/v1",
-  
-  // Headers (Impersonation)
+  AI_LANGUAGE: process.env.AI_LANGUAGE || "Vietnamese", // Default from file is "English", tuned for user
+
+  // Headers impersonating the specific client found in layout.js
   HEADERS: {
     "Host": "api.heckai.weight-wave.com",
     "Origin": "https://heck.ai",
     "Referer": "https://heck.ai/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "Content-Type": "application/json",
-    "Accept": "*/*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "cross-site",
-    "priority": "u=1, i"
+    "Accept": "*/*"
   },
 
-  // Model Mapping
+  // Model Mapping (Based on snippet 7 in layout.js)
   MODEL_MAP: {
     "gpt-4o-mini": "openai/gpt-4o-mini",
     "gpt-4o": "openai/chatgpt-4o-latest",
@@ -40,107 +36,51 @@ const CONFIG = {
     "deepseek-r1": "deepseek/deepseek-r1",
     "deepseek-v3": "deepseek/deepseek-chat",
     "claude-3.7-sonnet": "anthropic/claude-3.7-sonnet",
-    "grok-3-mini": "x-ai/grok-3-mini-beta"
+    "grok-3": "x-ai/grok-3-beta", // Updated from snippets
+    "gemini-2.0-flash": "google/gemini-2.0-flash-001"
   },
   
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
 
-// --- [2. Bun Server Entry] ---
-console.log(`🚀 Service running on port ${CONFIG.PORT}`);
-console.log(`🔑 Master Key: ${CONFIG.API_MASTER_KEY.slice(0, 4)}***`);
+// [2] Bun Server
+console.log(`🚀 Heck-2API running on port ${CONFIG.PORT}`);
+console.log(`🌍 Target: ${CONFIG.UPSTREAM_API_BASE}`);
 
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
     const url = new URL(req.url);
 
-    // CORS Preflight
+    // CORS Handling
     if (req.method === 'OPTIONS') return handleCorsPreflight();
 
-    // Health Check
-    if (url.pathname === '/') {
-      return new Response(JSON.stringify({ status: "alive", service: "heck-2api-bun" }), {
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
     // API Routes
-    if (url.pathname.startsWith('/v1/')) {
-      return await handleApi(req);
-    }
+    if (url.pathname === '/v1/chat/completions') return handleChatCompletions(req);
+    if (url.pathname === '/v1/models') return handleModels(req);
 
-    return createErrorResponse(`Path not found: ${url.pathname}`, 404, 'not_found');
+    // Health Check
+    if (url.pathname === '/') return new Response(JSON.stringify({ status: "ok", mode: "api-only" }), { headers: { "Content-Type": "application/json" } });
+
+    return new Response("Not Found", { status: 404 });
   }
 });
 
-// --- [3. API Logic] ---
+// [3] Core Logic
 
-async function handleApi(req) {
-  // Auth Check
-  const authHeader = req.headers.get('Authorization');
-  if (CONFIG.API_MASTER_KEY !== "1") {
-    if (!authHeader || authHeader !== `Bearer ${CONFIG.API_MASTER_KEY}`) {
-      return createErrorResponse('Unauthorized', 401, 'unauthorized');
-    }
-  }
+async function handleChatCompletions(req) {
+  if (!verifyAuth(req)) return createErrorResponse("Unauthorized", 401);
 
-  const url = new URL(req.url);
-  const requestId = `req-${crypto.randomUUID()}`;
-
-  if (url.pathname === '/v1/models') {
-    return handleModelsRequest();
-  } else if (url.pathname === '/v1/chat/completions') {
-    return handleChatCompletions(req, requestId);
-  } else {
-    return createErrorResponse(`Unsupported path: ${url.pathname}`, 404, 'not_found');
-  }
-}
-
-function handleModelsRequest() {
-  const modelsData = {
-    object: 'list',
-    data: Object.keys(CONFIG.MODEL_MAP).map(modelId => ({
-      id: modelId,
-      object: 'model',
-      created: Math.floor(Date.now() / 1000),
-      owned_by: 'heck-2api',
-    })),
-  };
-  return new Response(JSON.stringify(modelsData), {
-    headers: corsHeaders({ 'Content-Type': 'application/json' })
-  });
-}
-
-async function createSession(title = "New Chat") {
-  try {
-    const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
-      method: "POST",
-      headers: CONFIG.HEADERS,
-      body: JSON.stringify({ title })
-    });
-
-    if (!response.ok) throw new Error(`Session creation failed: ${response.status}`);
-    const data = await response.json();
-    return data.id;
-  } catch (e) {
-    console.error("Session Error:", e);
-    throw e;
-  }
-}
-
-async function handleChatCompletions(req, requestId) {
+  const requestId = `chatcmpl-${crypto.randomUUID()}`;
+  
   try {
     const body = await req.json();
     
-    // 1. Model Resolution
-    let requestModel = body.model || "gpt-4o-mini";
+    // -- 3.1 Model & Prompt Prep --
+    let requestModel = body.model || CONFIG.DEFAULT_MODEL;
     let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
-    if (!Object.values(CONFIG.MODEL_MAP).includes(upstreamModel) && !CONFIG.MODEL_MAP[requestModel]) {
-        upstreamModel = CONFIG.DEFAULT_MODEL;
-    }
-
-    // 2. Prompt Construction
+    
+    // Construct Prompt (Heck API takes a single 'question' string)
     let fullPrompt = "";
     let lastUserMsg = "";
     for (const msg of body.messages) {
@@ -152,22 +92,24 @@ async function handleChatCompletions(req, requestId) {
        else if (msg.role === 'assistant') fullPrompt += `[Assistant]: ${msg.content}\n`;
     }
 
-    // 3. Create Anonymous Session
-    const sessionTitle = (lastUserMsg.substring(0, 10) || "Chat").replace(/\n/g, "");
+    // -- 3.2 Ghost Session Creation --
+    // Based on snippet 7: P.A.post("/ha/v1/session/create",{title:e})
+    const sessionTitle = (lastUserMsg.substring(0, 15) || "New Chat").replace(/\n/g, " ");
     const sessionId = await createSession(sessionTitle);
 
-    // 4. Upstream Request
+    // -- 3.3 Construct Payload (Exact match with layout.js logic) --
+    // Snippet 3: JSON.stringify({model:a,question:s,language:r,sessionId:i,previousQuestion:l,previousAnswer:o})
     const upstreamPayload = {
       model: upstreamModel,
       question: fullPrompt.trim(),
-      language: "Chinese",
+      language: CONFIG.AI_LANGUAGE,
       sessionId: sessionId,
-      previousQuestion: null,
-      previousAnswer: null,
-      imgUrls: [],
-      superSmartMode: false
+      previousQuestion: null, // Always null for new ghost session
+      previousAnswer: null
     };
 
+    // -- 3.4 Request to Upstream --
+    // Based on snippet 3: V function
     const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
       method: "POST",
       headers: CONFIG.HEADERS,
@@ -175,11 +117,10 @@ async function handleChatCompletions(req, requestId) {
     });
 
     if (!response.ok) {
-      return createErrorResponse(`Upstream error: ${response.status}`, response.status, 'upstream_error');
+      return createErrorResponse(`Upstream Error: ${response.status}`, response.status);
     }
 
-    // 5. Stream Transformation
-    // Bun supports native Web Streams
+    // -- 3.5 Stream Transformation --
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -190,55 +131,61 @@ async function handleChatCompletions(req, requestId) {
         const reader = response.body.getReader();
         let buffer = "";
         let isReasoning = false;
+        let isSuggesting = false; // Flag to filter related questions
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
+          // Split by newlines as per SSE standard/Raw text logic
           const lines = buffer.split('\n');
           buffer = lines.pop() || "";
 
           for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const dataStr = line.slice(6).trim();
+            // Check for standard SSE "data: " prefix or raw lines
+            // layout.js handles raw text, but API usually sends "data: "
+            const cleanLine = line.startsWith('data: ') ? line.slice(6) : line;
+            const dataStr = cleanLine.trim();
 
-              // --- Protocol Parsing ---
-              if (['[ANSWER_DONE]', '[RELATE_Q_START]', '[RELATE_Q_DONE]'].includes(dataStr)) continue;
-              
-              if (dataStr === '[REASON_START]') { isReasoning = true; continue; }
-              if (dataStr === '[REASON_DONE]') { isReasoning = false; continue; }
-              if (dataStr === '[ANSWER_START]') continue;
-              
-              if (dataStr === '[ERROR]') continue;
-              if (dataStr.startsWith('{"error":')) {
-                  const errChunk = createChunk(requestId, requestModel, `\n[Error: ${dataStr}]`, "stop");
-                  await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-                  continue;
-              }
+            if (!dataStr) continue;
+            if (dataStr === '[DONE]') continue;
 
-              // Content Handling
-              let chunk = null;
-              if (isReasoning) {
-                  chunk = {
-                      id: requestId,
-                      object: "chat.completion.chunk",
-                      created: Math.floor(Date.now() / 1000),
-                      model: requestModel,
-                      choices: [{ index: 0, delta: { reasoning_content: dataStr }, finish_reason: null }]
-                  };
-              } else {
-                  chunk = createChunk(requestId, requestModel, dataStr);
-              }
-              await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            // --- FILTERING LOGIC (Remove Chat Suggestions) ---
+            if (dataStr === '[RELATE_Q_START]') { isSuggesting = true; continue; }
+            if (dataStr === '[RELATE_Q_DONE]') { isSuggesting = false; continue; }
+            if (isSuggesting) continue; // Skip all content inside suggestion block
+
+            // --- REASONING LOGIC (DeepSeek R1) ---
+            if (dataStr === '[REASON_START]') { isReasoning = true; continue; }
+            if (dataStr === '[REASON_DONE]') { isReasoning = false; continue; }
+            
+            // --- ANSWER LOGIC ---
+            if (dataStr === '[ANSWER_START]') continue;
+            if (dataStr === '[ANSWER_DONE]') continue;
+            
+            // Error handling
+            if (dataStr.startsWith('{"error":')) continue;
+
+            // Create Chunk
+            let chunk;
+            if (isReasoning) {
+                // OpenAI Reasoning Format
+                chunk = createChunk(requestId, requestModel, dataStr, null, true);
+            } else {
+                // Standard Content
+                chunk = createChunk(requestId, requestModel, dataStr, null, false);
             }
+
+            await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
           }
         }
         
+        // Finalize
         await writer.write(encoder.encode('data: [DONE]\n\n'));
       } catch (e) {
-        console.error("Stream Error", e);
-        const errChunk = createChunk(requestId, requestModel, `\n[Stream Error]`, "stop");
+        console.error("Stream pipe error:", e);
+        const errChunk = createChunk(requestId, requestModel, `\n[Error: ${e.message}]`, "stop");
         await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
       } finally {
         await writer.close();
@@ -246,35 +193,63 @@ async function handleChatCompletions(req, requestId) {
     })();
 
     return new Response(readable, {
-      headers: corsHeaders({ 
-        'Content-Type': 'text/event-stream',
-        'X-Heck-Session-Id': sessionId
-      })
+      headers: corsHeaders({ 'Content-Type': 'text/event-stream' })
     });
 
   } catch (e) {
-    return createErrorResponse(e.message, 500, 'internal_error');
+    console.error(e);
+    return createErrorResponse("Internal Server Error", 500);
   }
 }
 
-// --- [4. Helpers] ---
+// [4] Helpers
 
-function createChunk(id, model, content, finishReason = null) {
+async function createSession(title) {
+  try {
+    const res = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
+      method: "POST",
+      headers: CONFIG.HEADERS,
+      body: JSON.stringify({ title })
+    });
+    if(!res.ok) throw new Error("Session creation failed");
+    const data = await res.json();
+    return data.id;
+  } catch (e) {
+    // Fallback: use a random ID if API fails (though upstream might reject it)
+    console.warn("Failed to create session, using random UUID");
+    return crypto.randomUUID();
+  }
+}
+
+function createChunk(id, model, content, finishReason = null, isReasoning = false) {
+  const delta = isReasoning ? { reasoning_content: content } : { content: content };
   return {
     id: id,
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
     model: model,
-    choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }]
+    choices: [{ index: 0, delta: delta, finish_reason: finishReason }]
   };
 }
 
-function createErrorResponse(message, status, code) {
-  return new Response(JSON.stringify({
-    error: { message, type: 'api_error', code }
-  }), {
-    status,
+function handleModels(req) {
+  const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({
+    id, object: "model", created: Date.now(), owned_by: "heck-ai"
+  }));
+  return new Response(JSON.stringify({ object: "list", data: models }), {
     headers: corsHeaders({ 'Content-Type': 'application/json' })
+  });
+}
+
+function verifyAuth(req) {
+  const auth = req.headers.get('Authorization');
+  if (CONFIG.API_MASTER_KEY === "1") return true; // Debug mode
+  return auth === `Bearer ${CONFIG.API_MASTER_KEY}`;
+}
+
+function createErrorResponse(msg, code) {
+  return new Response(JSON.stringify({ error: { message: msg } }), {
+    status: code, headers: corsHeaders({ 'Content-Type': 'application/json' })
   });
 }
 
@@ -287,6 +262,6 @@ function corsHeaders(headers = {}) {
     ...headers,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
   };
 }
