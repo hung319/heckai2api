@@ -1,18 +1,33 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 3.1.0 (Stable & Safe Config)
+ * Version: 3.3.0 (Regex Parser Fix)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v3.1]
- * - Fix: Lỗi "ERR_INVALID_URL" do biến môi trường bị rỗng hoặc format sai.
- * - Core: Giữ nguyên logic Aggressive Formatting của v3.0.
+ * [Changelog v3.3]
+ * - Fix: Thay thế slice() bằng Regex /^data: ?/ để xử lý dính chữ triệt để.
+ * - Fix: Sửa lỗi hiển thị icon (Mojibake).
+ * - Core: Giữ nguyên Logging & Safe Config.
  * =================================================================================
  */
 
 import { randomUUID } from "crypto";
 
-// --- [SAFE CONFIGURATION] ---
+// --- [LOGGING HELPER] ---
+const log = (level: "INFO" | "WARN" | "ERROR" | "DEBUG", reqId: string, msg: string, data?: any) => {
+  const time = new Date().toISOString().split("T")[1].replace("Z", "");
+  let dataStr = "";
+  if (data) {
+    try {
+      const str = JSON.stringify(data);
+      dataStr = str.length > 500 ? ` ${str.slice(0, 500)}...` : ` ${str}`;
+    } catch { dataStr = " [Data Error]"; }
+  }
+  const colors = { INFO: "\x1b[32m", WARN: "\x1b[33m", ERROR: "\x1b[31m", DEBUG: "\x1b[36m", RESET: "\x1b[0m" };
+  console.log(`${colors[level]}[${time}] [${reqId}] ${msg}${colors.RESET}${dataStr}`);
+};
+
+// --- [SAFE CONFIG] ---
 const getEnv = (key: string, def: string) => {
   const val = process.env[key];
   return val ? val.trim().replace(/\/$/, "") : def;
@@ -21,7 +36,6 @@ const getEnv = (key: string, def: string) => {
 const CONFIG = {
   PORT: parseInt(process.env.PORT || "3000"),
   API_KEY: (process.env.API_MASTER_KEY || "1").trim(),
-  // Đảm bảo URL luôn hợp lệ và không có dấu / ở cuối
   UPSTREAM_API_BASE: getEnv("UPSTREAM_API_BASE", "https://api.heckai.weight-wave.com/api/ha/v1"),
   
   HEADERS: {
@@ -72,44 +86,42 @@ const extractText = (content: any): string => {
   return "";
 };
 
-async function createSession(title = "Chat") {
+async function createSession(reqId: string, title = "Chat") {
   const targetUrl = `${CONFIG.UPSTREAM_API_BASE}/session/create`;
+  log("DEBUG", reqId, "Creating Upstream Session...", { title });
   try {
-    // Debug log để kiểm tra URL nếu lỗi xảy ra
-    // console.log("Creating session at:", targetUrl); 
-
     const res = await fetch(targetUrl, {
       method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title }),
     });
-    
-    if (!res.ok) throw new Error(`Failed to create session [${res.status}]: ${res.statusText}`);
+    if (!res.ok) throw new Error(`Status ${res.status}: ${res.statusText}`);
     const data = await res.json() as any;
+    log("INFO", reqId, "Session Created", { sessionId: data.id });
     return data.id;
   } catch (e: any) { 
-    console.error(`[Session Error] URL: ${targetUrl} | Message: ${e.message}`); 
+    log("ERROR", reqId, "Session Creation Failed", e.message);
     throw e; 
   }
 }
 
-// --- [AGGRESSIVE FORMATTER] ---
+// --- [FORMATTER] ---
 function formatChunk(text: string): string {
   let formatted = text;
-  // 1. Fix dính Header: "text###" -> "text\n\n###"
-  formatted = formatted.replace(/([^\n])\s?(###+\s)/g, "$1\n\n$2");
-  // 2. Fix dính List số (đậm): "text1. **" -> "text\n\n1. **"
-  formatted = formatted.replace(/([a-zA-Z0-9])\s?(\d+\.\s\*\*)/g, "$1\n\n$2");
-  // 3. Fix dính List thường: "text- Item" -> "text\n\n- Item"
-  formatted = formatted.replace(/([^\n])\s?(- \*\*|- [a-zA-Z])/g, "$1\n\n$2");
-  // 4. Fix dính Code block: "text```" -> "text\n\n```"
-  formatted = formatted.replace(/([^\n])\s?(```)/g, "$1\n\n$2");
+  // Tự động xuống dòng trước các thẻ quan trọng nếu bị dính
+  formatted = formatted.replace(/([^\n])\s?(###+\s)/g, "$1\n\n$2"); // Header
+  formatted = formatted.replace(/([a-zA-Z0-9])\s?(\d+\.\s\*\*)/g, "$1\n\n$2"); // List số
+  formatted = formatted.replace(/([^\n])\s?(- \*\*|- [a-zA-Z])/g, "$1\n\n$2"); // List thường
+  formatted = formatted.replace(/([^\n])\s?(```)/g, "$1\n\n$2"); // Code block
   return formatted;
 }
 
-// --- [CORE LOGIC] ---
-
+// --- [STREAM PROCESSOR] ---
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
-  if (!reader) throw new Error("No response body from upstream");
+  if (!reader) {
+      log("ERROR", requestId, "No response body");
+      throw new Error("No response body");
+  }
+  log("INFO", requestId, "Stream Started");
 
   const decoder = new TextDecoder();
   let buffer = "";
@@ -126,35 +138,37 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        let dataStr = "";
-        if (line.startsWith("data: ")) dataStr = line.slice(6);
-        else if (line.startsWith("data:")) dataStr = line.slice(5);
-        else continue;
+        // [FIX: Regex Parser] 
+        // Thay vì slice(), dùng regex để chỉ xóa "data:" và TỐI ĐA 1 dấu cách.
+        // Nếu dòng là "data:  hello" (2 dấu cách) -> kết quả là " hello" (1 dấu cách).
+        if (!line.startsWith("data:")) continue;
+        let dataStr = line.replace(/^data: ?/, ""); // ? nghĩa là 0 hoặc 1 dấu cách
 
         if (dataStr.endsWith("\r")) dataStr = dataStr.slice(0, -1);
         
         const tagCheck = dataStr.trim();
 
-        // Filters (No Suggestions)
-        if (tagCheck === "[ANSWER_DONE]") break;
-        if (tagCheck.startsWith("[RELATE_Q")) break;
+        // Filters
+        if (tagCheck === "[ANSWER_DONE]") { log("DEBUG", requestId, "End: [ANSWER_DONE]"); break; }
+        if (tagCheck.startsWith("[RELATE_Q")) { log("DEBUG", requestId, "End: [RELATE_Q]"); break; }
 
-        // Reasoning Tags
+        // Reasoning
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
         if (tagCheck === "[REASON_DONE]") { isReasoning = false; continue; }
         if (tagCheck === "[ANSWER_START]") continue;
 
         // Cleanup
+        // Fix emoji lỗi font (Mojibake)
         if (dataStr.includes("ðŸ˜Š")) dataStr = dataStr.replace(/ðŸ˜Š/g, "😊");
-        if (dataStr.includes("âœ©") || dataStr.includes("✩")) break;
+        // Chặn gợi ý sao
+        if (dataStr.includes("âœ©") || dataStr.includes("✩")) { log("DEBUG", requestId, "End: Star"); break; }
 
-        // --- [APPLY FORMATTING] ---
+        // Formatting
         if (!isReasoning) {
             dataStr = formatChunk(dataStr);
-
+            
             const cleanStart = dataStr.trimStart();
             const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
-            
             if (isBlockStart && lastChar && !lastChar.endsWith("\n")) {
                 dataStr = "\n\n" + dataStr;
             }
@@ -162,7 +176,7 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
         if (dataStr.length > 0) lastChar = dataStr;
 
-        // Output
+        // Output Chunk
         let chunk: any = null;
         if (isReasoning) {
           chunk = {
@@ -175,15 +189,15 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
             choices: [{ index: 0, delta: { content: dataStr }, finish_reason: null }]
           };
         }
-
         yield `data: ${JSON.stringify(chunk)}\n\n`;
       }
       
       if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q")) break;
     }
+    log("INFO", requestId, "Stream Finished");
     yield `data: [DONE]\n\n`;
-  } catch (e) {
-    console.error("Stream Error:", e);
+  } catch (e: any) {
+    log("ERROR", requestId, "Stream Error", e.message);
     yield `data: ${JSON.stringify({
         id: requestId, object: "chat.completion.chunk", model: model,
         choices: [{ index: 0, delta: { content: "\n[Error]" }, finish_reason: "stop" }]
@@ -194,23 +208,22 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 }
 
 // --- [HANDLERS] ---
-
 async function handleChatCompletions(req: Request): Promise<Response> {
+  const requestId = `chatcmpl-${randomUUID().slice(0, 8)}`;
   let body: any;
   try { body = await req.json(); } catch { return Response.json({ error: "Invalid JSON" }, { status: 400 }); }
 
-  const requestId = `chatcmpl-${randomUUID()}`;
   const requestModel = body.model || "gpt-4o-mini";
-  
+  log("INFO", requestId, "Request", { model: requestModel, stream: body.stream });
+
   let upstreamModel = CONFIG.MODEL_MAP[requestModel];
   if (!upstreamModel) {
       if (requestModel.includes("/")) upstreamModel = requestModel;
       else upstreamModel = CONFIG.DEFAULT_MODEL;
   }
-
+  
   let fullPrompt = "";
   let lastUserMsg = "";
-  
   for (const msg of (body.messages || [])) {
     const contentStr = extractText(msg.content);
     if (msg.role === "system") fullPrompt += `[System]: ${contentStr}\n`;
@@ -226,10 +239,8 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   
   let sessionId;
   try {
-    sessionId = await createSession(sessionTitle);
-  } catch (e) {
-    return Response.json({ error: "Upstream session error" }, { status: 502 });
-  }
+    sessionId = await createSession(requestId, sessionTitle);
+  } catch (e) { return Response.json({ error: "Upstream session error" }, { status: 502 }); }
 
   const upstreamPayload = {
     model: upstreamModel,
@@ -246,15 +257,17 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify(upstreamPayload)
   });
 
-  if (!upstreamRes.ok) return Response.json({ error: `Upstream: ${upstreamRes.status}` }, { status: upstreamRes.status });
+  if (!upstreamRes.ok) {
+      log("ERROR", requestId, "Upstream Failed", await upstreamRes.text());
+      return Response.json({ error: `Upstream: ${upstreamRes.status}` }, { status: upstreamRes.status });
+  }
 
-  const isStream = body.stream === true;
-
-  if (isStream) {
+  if (body.stream === true) {
     return new Response(streamProcessor(upstreamRes, requestId, requestModel), {
       headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Connection": "keep-alive" }
     });
   } else {
+    log("INFO", requestId, "Non-Stream Accumulating...");
     let fullContent = "";
     let fullReasoning = "";
     for await (const chunkStr of streamProcessor(upstreamRes, requestId, requestModel)) {
@@ -267,14 +280,14 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       } catch {}
     }
     return Response.json({
-      id: requestId, object: "chat.completion", created: Date.now()/1000|0, model: requestModel,
+      id: requestId, object: "chat.completion", created: Math.floor(Date.now()/1000), model: requestModel,
       choices: [{ index: 0, message: { role: "assistant", content: fullContent, reasoning_content: fullReasoning }, finish_reason: "stop" }]
     }, { headers: corsHeaders() });
   }
 }
 
 // --- [SERVER] ---
-console.log(`🚀 Heck-2API (Bun) v3.1 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v3.3 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
@@ -285,8 +298,7 @@ Bun.serve({
       return handleChatCompletions(req);
     }
     if (url.pathname === "/v1/models") {
-        const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({ id, object: "model", created: Date.now(), owned_by: "heck-bun" }));
-        return Response.json({ object: "list", data: models }, { headers: corsHeaders() });
+        return Response.json({ object: "list", data: Object.keys(CONFIG.MODEL_MAP).map(id => ({ id, object: "model", created: Date.now(), owned_by: "heck-bun" })) }, { headers: corsHeaders() });
     }
     return Response.json({ error: "Not Found" }, { status: 404 });
   }
