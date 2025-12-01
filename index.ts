@@ -1,31 +1,16 @@
 /**
  * =================================================================================
  * Project: heck-2api (Bun Edition)
- * Version: 3.3.0 (Regex Parser Fix)
+ * Version: 3.4.0 (Silent Production)
  * Author: Senior Software Engineer (Ported by CezDev)
  *
- * [Changelog v3.3]
- * - Fix: Thay thế slice() bằng Regex /^data: ?/ để xử lý dính chữ triệt để.
- * - Fix: Sửa lỗi hiển thị icon (Mojibake).
- * - Core: Giữ nguyên Logging & Safe Config.
+ * [Changelog v3.4]
+ * - Removed: Loại bỏ toàn bộ Logs (Debug/Info) để tối ưu hiệu năng.
+ * - Core: Giữ nguyên logic Regex Parser & Formatting của v3.3.
  * =================================================================================
  */
 
 import { randomUUID } from "crypto";
-
-// --- [LOGGING HELPER] ---
-const log = (level: "INFO" | "WARN" | "ERROR" | "DEBUG", reqId: string, msg: string, data?: any) => {
-  const time = new Date().toISOString().split("T")[1].replace("Z", "");
-  let dataStr = "";
-  if (data) {
-    try {
-      const str = JSON.stringify(data);
-      dataStr = str.length > 500 ? ` ${str.slice(0, 500)}...` : ` ${str}`;
-    } catch { dataStr = " [Data Error]"; }
-  }
-  const colors = { INFO: "\x1b[32m", WARN: "\x1b[33m", ERROR: "\x1b[31m", DEBUG: "\x1b[36m", RESET: "\x1b[0m" };
-  console.log(`${colors[level]}[${time}] [${reqId}] ${msg}${colors.RESET}${dataStr}`);
-};
 
 // --- [SAFE CONFIG] ---
 const getEnv = (key: string, def: string) => {
@@ -86,19 +71,16 @@ const extractText = (content: any): string => {
   return "";
 };
 
-async function createSession(reqId: string, title = "Chat") {
+async function createSession(title = "Chat") {
   const targetUrl = `${CONFIG.UPSTREAM_API_BASE}/session/create`;
-  log("DEBUG", reqId, "Creating Upstream Session...", { title });
   try {
     const res = await fetch(targetUrl, {
       method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title }),
     });
     if (!res.ok) throw new Error(`Status ${res.status}: ${res.statusText}`);
     const data = await res.json() as any;
-    log("INFO", reqId, "Session Created", { sessionId: data.id });
     return data.id;
   } catch (e: any) { 
-    log("ERROR", reqId, "Session Creation Failed", e.message);
     throw e; 
   }
 }
@@ -106,7 +88,6 @@ async function createSession(reqId: string, title = "Chat") {
 // --- [FORMATTER] ---
 function formatChunk(text: string): string {
   let formatted = text;
-  // Tự động xuống dòng trước các thẻ quan trọng nếu bị dính
   formatted = formatted.replace(/([^\n])\s?(###+\s)/g, "$1\n\n$2"); // Header
   formatted = formatted.replace(/([a-zA-Z0-9])\s?(\d+\.\s\*\*)/g, "$1\n\n$2"); // List số
   formatted = formatted.replace(/([^\n])\s?(- \*\*|- [a-zA-Z])/g, "$1\n\n$2"); // List thường
@@ -117,11 +98,7 @@ function formatChunk(text: string): string {
 // --- [STREAM PROCESSOR] ---
 async function* streamProcessor(upstreamResponse: Response, requestId: string, model: string) {
   const reader = upstreamResponse.body?.getReader();
-  if (!reader) {
-      log("ERROR", requestId, "No response body");
-      throw new Error("No response body");
-  }
-  log("INFO", requestId, "Stream Started");
+  if (!reader) throw new Error("No response body");
 
   const decoder = new TextDecoder();
   let buffer = "";
@@ -138,19 +115,16 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        // [FIX: Regex Parser] 
-        // Thay vì slice(), dùng regex để chỉ xóa "data:" và TỐI ĐA 1 dấu cách.
-        // Nếu dòng là "data:  hello" (2 dấu cách) -> kết quả là " hello" (1 dấu cách).
         if (!line.startsWith("data:")) continue;
-        let dataStr = line.replace(/^data: ?/, ""); // ? nghĩa là 0 hoặc 1 dấu cách
-
+        
+        // Regex Parser: Xử lý dính chữ
+        let dataStr = line.replace(/^data: ?/, "");
         if (dataStr.endsWith("\r")) dataStr = dataStr.slice(0, -1);
         
         const tagCheck = dataStr.trim();
 
-        // Filters
-        if (tagCheck === "[ANSWER_DONE]") { log("DEBUG", requestId, "End: [ANSWER_DONE]"); break; }
-        if (tagCheck.startsWith("[RELATE_Q")) { log("DEBUG", requestId, "End: [RELATE_Q]"); break; }
+        // Filters (Stop on Suggestions)
+        if (tagCheck === "[ANSWER_DONE]" || tagCheck.startsWith("[RELATE_Q")) break;
 
         // Reasoning
         if (tagCheck === "[REASON_START]") { isReasoning = true; continue; }
@@ -158,15 +132,12 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
         if (tagCheck === "[ANSWER_START]") continue;
 
         // Cleanup
-        // Fix emoji lỗi font (Mojibake)
         if (dataStr.includes("ðŸ˜Š")) dataStr = dataStr.replace(/ðŸ˜Š/g, "😊");
-        // Chặn gợi ý sao
-        if (dataStr.includes("âœ©") || dataStr.includes("✩")) { log("DEBUG", requestId, "End: Star"); break; }
+        if (dataStr.includes("âœ©") || dataStr.includes("✩")) break;
 
         // Formatting
         if (!isReasoning) {
             dataStr = formatChunk(dataStr);
-            
             const cleanStart = dataStr.trimStart();
             const isBlockStart = /^(?:- |\* |\d+\. |### |```)/.test(cleanStart);
             if (isBlockStart && lastChar && !lastChar.endsWith("\n")) {
@@ -194,10 +165,8 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
       
       if (buffer.includes("[ANSWER_DONE]") || buffer.includes("[RELATE_Q")) break;
     }
-    log("INFO", requestId, "Stream Finished");
     yield `data: [DONE]\n\n`;
   } catch (e: any) {
-    log("ERROR", requestId, "Stream Error", e.message);
     yield `data: ${JSON.stringify({
         id: requestId, object: "chat.completion.chunk", model: model,
         choices: [{ index: 0, delta: { content: "\n[Error]" }, finish_reason: "stop" }]
@@ -209,12 +178,11 @@ async function* streamProcessor(upstreamResponse: Response, requestId: string, m
 
 // --- [HANDLERS] ---
 async function handleChatCompletions(req: Request): Promise<Response> {
-  const requestId = `chatcmpl-${randomUUID().slice(0, 8)}`;
+  const requestId = `chatcmpl-${randomUUID()}`;
   let body: any;
   try { body = await req.json(); } catch { return Response.json({ error: "Invalid JSON" }, { status: 400 }); }
 
   const requestModel = body.model || "gpt-4o-mini";
-  log("INFO", requestId, "Request", { model: requestModel, stream: body.stream });
 
   let upstreamModel = CONFIG.MODEL_MAP[requestModel];
   if (!upstreamModel) {
@@ -239,7 +207,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   
   let sessionId;
   try {
-    sessionId = await createSession(requestId, sessionTitle);
+    sessionId = await createSession(sessionTitle);
   } catch (e) { return Response.json({ error: "Upstream session error" }, { status: 502 }); }
 
   const upstreamPayload = {
@@ -258,7 +226,6 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   });
 
   if (!upstreamRes.ok) {
-      log("ERROR", requestId, "Upstream Failed", await upstreamRes.text());
       return Response.json({ error: `Upstream: ${upstreamRes.status}` }, { status: upstreamRes.status });
   }
 
@@ -267,7 +234,6 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Connection": "keep-alive" }
     });
   } else {
-    log("INFO", requestId, "Non-Stream Accumulating...");
     let fullContent = "";
     let fullReasoning = "";
     for await (const chunkStr of streamProcessor(upstreamRes, requestId, requestModel)) {
@@ -287,7 +253,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 }
 
 // --- [SERVER] ---
-console.log(`🚀 Heck-2API (Bun) v3.3 running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Bun) v3.4 running on port ${CONFIG.PORT}`);
 Bun.serve({
   port: CONFIG.PORT,
   async fetch(req) {
