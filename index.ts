@@ -1,10 +1,11 @@
 /**
  * =================================================================================
  * Project: Heck-2API (Bun Edition)
- * Version: 1.6.0 (Stability Fix)
- * Fixes:
- * - [x] TypeError: Cannot close a writable stream
- * - [x] Handle "Stream error: undefined" (Client Disconnect)
+ * Version: 1.7.0 (Logger Edition)
+ * Features:
+ * - [x] Detailed Logging for Debugging
+ * - [x] Request Tracing with IDs
+ * - [x] All previous fixes (Crash proof, Logic fixes)
  * =================================================================================
  */
 
@@ -14,6 +15,9 @@ const CONFIG = {
   UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "https://api.heckai.weight-wave.com/api/ha/v1",
   AI_LANGUAGE: process.env.AI_LANGUAGE || "Vietnamese",
   
+  // Bật/Tắt log chi tiết nội dung stream (khuyên dùng false để đỡ spam console)
+  DEBUG_STREAM_DATA: false, 
+
   HEADERS: {
     "Host": "api.heckai.weight-wave.com",
     "Origin": "https://heck.ai",
@@ -38,7 +42,19 @@ const CONFIG = {
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
 
-console.log(`🚀 Heck-2API running on port ${CONFIG.PORT}`);
+// --- Logger Helper ---
+function log(id: string, type: string, msg: string) {
+    const time = new Date().toLocaleTimeString();
+    let color = "\x1b[37m"; // White
+    if (type === 'INFO') color = "\x1b[36m"; // Cyan
+    if (type === 'UPSTREAM') color = "\x1b[33m"; // Yellow
+    if (type === 'STREAM') color = "\x1b[32m"; // Green
+    if (type === 'ERROR') color = "\x1b[31m"; // Red
+
+    console.log(`\x1b[90m[${time}]\x1b[0m \x1b[35m[${id}]\x1b[0m ${color}[${type}]\x1b[0m ${msg}`);
+}
+
+console.log(`🚀 Heck-2API (Logger Mode) running on port ${CONFIG.PORT}`);
 
 Bun.serve({
   port: CONFIG.PORT,
@@ -66,15 +82,20 @@ function extractContent(content: any): string {
 }
 
 async function handleChatCompletions(req) {
-  if (!verifyAuth(req)) return createErrorResponse("Unauthorized", 401);
-
-  const requestId = `chatcmpl-${crypto.randomUUID()}`;
+  const reqId = `req-${Math.floor(Math.random() * 10000)}`;
   
+  if (!verifyAuth(req)) {
+      log(reqId, 'ERROR', 'Auth Failed');
+      return createErrorResponse("Unauthorized", 401);
+  }
+
   try {
     const body = await req.json();
     let requestModel = body.model || CONFIG.DEFAULT_MODEL;
     let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
     
+    log(reqId, 'INFO', `Incoming Request: ${requestModel} -> Mapped to: ${upstreamModel}`);
+
     let fullPrompt = "";
     let lastUserMsg = "";
 
@@ -91,35 +112,47 @@ async function handleChatCompletions(req) {
     const safeTitle = (lastUserMsg && typeof lastUserMsg === 'string') ? lastUserMsg : "New Chat";
     const sessionTitle = (safeTitle.substring(0, 15) || "Chat").replace(/\n/g, " ");
     
-    const sessionId = await createSession(sessionTitle);
+    log(reqId, 'INFO', `Creating Session: "${sessionTitle}"`);
+    const sessionId = await createSession(sessionTitle, reqId);
+    log(reqId, 'INFO', `Session ID: ${sessionId}`);
 
-    const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
-      method: "POST",
-      headers: CONFIG.HEADERS,
-      body: JSON.stringify({
+    const payload = {
         model: upstreamModel,
         question: fullPrompt.trim(),
         language: CONFIG.AI_LANGUAGE,
         sessionId: sessionId,
         previousQuestion: null,
         previousAnswer: null
-      })
+    };
+
+    log(reqId, 'UPSTREAM', `Sending payload (Length: ${payload.question.length} chars)...`);
+
+    const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
+      method: "POST",
+      headers: CONFIG.HEADERS,
+      body: JSON.stringify(payload)
     });
 
-    if (!response.ok) return createErrorResponse(`Upstream Error: ${response.status}`, response.status);
+    if (!response.ok) {
+        const errText = await response.text();
+        log(reqId, 'ERROR', `Upstream Status: ${response.status} - Body: ${errText}`);
+        return createErrorResponse(`Upstream Error: ${response.status}`, response.status);
+    }
+
+    log(reqId, 'UPSTREAM', `Response OK (${response.status}). Starting Stream...`);
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
-    // --- STREAM PROCESSING (SAFE MODE) ---
     (async () => {
       try {
         const reader = response.body.getReader();
         let buffer = "";
         let isReasoning = false;
         let stopStream = false;
+        let totalChunks = 0;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -139,56 +172,73 @@ async function handleChatCompletions(req) {
             else content = temp;
 
             const command = content.trim();
+
+            // --- Logging Events ---
+            if (command === '[REASON_START]') log(reqId, 'STREAM', 'Thinking Started (DeepSeek Mode)');
+            if (command === '[ANSWER_DONE]') log(reqId, 'STREAM', 'Answer Done (Stopping Stream)');
+            if (command === '[RELATE_Q_START]') log(reqId, 'STREAM', 'Related Qs detected (Stopping Stream)');
+            
+            if (CONFIG.DEBUG_STREAM_DATA && content.length > 0) {
+                 console.log(`   [Raw Data]: ${content.substring(0, 50).replace(/\n/g, '\\n')}...`);
+            }
+
+            // --- Logic Control ---
             if (command === '[ANSWER_DONE]' || command === '[RELATE_Q_START]') {
                 stopStream = true; break;
             }
             if (command === '[DONE]' || command === '[ANSWER_START]') continue;
             if (command === '[REASON_START]') { isReasoning = true; continue; }
             if (command === '[REASON_DONE]') { isReasoning = false; continue; }
-            if (command.startsWith('{"error":')) continue;
+            if (command.startsWith('{"error":')) {
+                log(reqId, 'ERROR', `Stream sent error JSON: ${command}`);
+                continue;
+            }
 
             if (content.length === 0) content = "\n";
 
-            const chunk = createChunk(requestId, requestModel, content, null, isReasoning);
-            // Kiểm tra writer trước khi write để tránh lỗi
+            const chunk = createChunk(reqId, requestModel, content, null, isReasoning);
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            totalChunks++;
           }
         }
         
+        log(reqId, 'INFO', `Stream Finished. Total Chunks Sent: ${totalChunks}`);
         await writer.write(encoder.encode('data: [DONE]\n\n'));
       } catch (e) {
-        // Chỉ log lỗi thật, bỏ qua lỗi disconnect (undefined hoặc AbortError)
         if (e && e.name !== 'AbortError') {
-             console.error("Stream Warning:", e.message || "Client Disconnected");
+             log(reqId, 'ERROR', `Stream Broken: ${e.message}`);
+        } else {
+             log(reqId, 'INFO', `Client Disconnected`);
         }
       } finally {
-        // [FIX QUAN TRỌNG] Bọc close trong try/catch để tránh crash server
-        try {
-            await writer.close();
-        } catch (e) {
-            // Ignore error if stream is already closed
-        }
+        try { await writer.close(); } catch (e) {}
       }
     })();
 
     return new Response(readable, { headers: corsHeaders({ 'Content-Type': 'text/event-stream' }) });
   } catch (e) {
-    console.error("Critical Error:", e);
+    log(reqId, 'ERROR', `Critical Crash: ${e.message}`);
     return createErrorResponse(e.message, 500);
   }
 }
 
 // --- Helpers ---
 
-async function createSession(title) {
+async function createSession(title, reqId) {
   try {
     const res = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
       method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title })
     });
-    if(!res.ok) return crypto.randomUUID();
+    if(!res.ok) {
+        log(reqId, 'UPSTREAM', `Create Session Failed: ${res.status}`);
+        return crypto.randomUUID();
+    }
     const data = await res.json();
     return data.id;
-  } catch (e) { return crypto.randomUUID(); }
+  } catch (e) { 
+      log(reqId, 'ERROR', `Create Session Exception: ${e.message}`);
+      return crypto.randomUUID(); 
+  }
 }
 
 function createChunk(id, model, content, finishReason, isReasoning) {
@@ -200,10 +250,12 @@ function createChunk(id, model, content, finishReason, isReasoning) {
 }
 
 function handleModels(req) {
-    const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({
-        id, object: "model", created: Date.now(), owned_by: "heck-ai"
-    }));
-    return new Response(JSON.stringify({ object: "list", data: models }), { headers: corsHeaders() });
+    return new Response(JSON.stringify({ 
+        object: "list", 
+        data: Object.keys(CONFIG.MODEL_MAP).map(id => ({
+            id, object: "model", created: Date.now(), owned_by: "heck-ai"
+        })) 
+    }), { headers: corsHeaders() });
 }
 
 function verifyAuth(req) {
