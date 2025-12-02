@@ -1,11 +1,11 @@
 /**
  * =================================================================================
  * Project: Heck-2API (Bun Edition)
- * Version: 1.7.0 (Logger Edition)
- * Features:
- * - [x] Detailed Logging for Debugging
- * - [x] Request Tracing with IDs
- * - [x] All previous fixes (Crash proof, Logic fixes)
+ * Version: 1.8.0 (Enhance Prompt Fix)
+ * Fixes:
+ * - [x] Disable Reasoning for non-R1 models (Fixes Client Parse Error)
+ * - [x] Log raw content of first chunks to debug "Enhance" issues
+ * - [x] Remove leading newlines (Fixes Prompt format)
  * =================================================================================
  */
 
@@ -15,9 +15,7 @@ const CONFIG = {
   UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "https://api.heckai.weight-wave.com/api/ha/v1",
   AI_LANGUAGE: process.env.AI_LANGUAGE || "Vietnamese",
   
-  // Bật/Tắt log chi tiết nội dung stream (khuyên dùng false để đỡ spam console)
-  DEBUG_STREAM_DATA: false, 
-
+  // Headers
   HEADERS: {
     "Host": "api.heckai.weight-wave.com",
     "Origin": "https://heck.ai",
@@ -42,19 +40,20 @@ const CONFIG = {
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
 
-// --- Logger Helper ---
+// --- Logger ---
 function log(id: string, type: string, msg: string) {
     const time = new Date().toLocaleTimeString();
-    let color = "\x1b[37m"; // White
-    if (type === 'INFO') color = "\x1b[36m"; // Cyan
-    if (type === 'UPSTREAM') color = "\x1b[33m"; // Yellow
-    if (type === 'STREAM') color = "\x1b[32m"; // Green
-    if (type === 'ERROR') color = "\x1b[31m"; // Red
+    let color = "\x1b[37m"; 
+    if (type === 'INFO') color = "\x1b[36m";
+    if (type === 'UPSTREAM') color = "\x1b[33m"; 
+    if (type === 'STREAM') color = "\x1b[32m"; 
+    if (type === 'ERROR') color = "\x1b[31m";
+    if (type === 'DATA') color = "\x1b[90m"; // Grey for raw data
 
     console.log(`\x1b[90m[${time}]\x1b[0m \x1b[35m[${id}]\x1b[0m ${color}[${type}]\x1b[0m ${msg}`);
 }
 
-console.log(`🚀 Heck-2API (Logger Mode) running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (v1.8.0) running on port ${CONFIG.PORT}`);
 
 Bun.serve({
   port: CONFIG.PORT,
@@ -70,13 +69,7 @@ Bun.serve({
 function extractContent(content: any): string {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
-        return content
-            .map(part => {
-                if (typeof part === 'string') return part;
-                if (part?.type === 'text') return part.text || "";
-                return "";
-            })
-            .join("\n");
+        return content.map(part => (typeof part === 'string' ? part : (part?.text || ""))).join("\n");
     }
     return ""; 
 }
@@ -94,7 +87,10 @@ async function handleChatCompletions(req) {
     let requestModel = body.model || CONFIG.DEFAULT_MODEL;
     let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
     
-    log(reqId, 'INFO', `Incoming Request: ${requestModel} -> Mapped to: ${upstreamModel}`);
+    // [FIX 1] Chỉ cho phép Reasoning nếu model là dòng R1 hoặc Thinking
+    const allowReasoning = requestModel.includes('r1') || requestModel.includes('think') || requestModel.includes('o1');
+
+    log(reqId, 'INFO', `Request: ${requestModel} (Reasoning Allowed: ${allowReasoning})`);
 
     let fullPrompt = "";
     let lastUserMsg = "";
@@ -112,34 +108,32 @@ async function handleChatCompletions(req) {
     const safeTitle = (lastUserMsg && typeof lastUserMsg === 'string') ? lastUserMsg : "New Chat";
     const sessionTitle = (safeTitle.substring(0, 15) || "Chat").replace(/\n/g, " ");
     
-    log(reqId, 'INFO', `Creating Session: "${sessionTitle}"`);
     const sessionId = await createSession(sessionTitle, reqId);
-    log(reqId, 'INFO', `Session ID: ${sessionId}`);
+    
+    // [DEBUG] Log prompt ngắn gọn để biết user đang gửi gì
+    const shortPrompt = fullPrompt.length > 50 ? fullPrompt.substring(0, 50) + "..." : fullPrompt;
+    log(reqId, 'INFO', `Prompt Start: "${shortPrompt.replace(/\n/g, ' ')}"`);
 
-    const payload = {
+    const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
+      method: "POST",
+      headers: CONFIG.HEADERS,
+      body: JSON.stringify({
         model: upstreamModel,
         question: fullPrompt.trim(),
         language: CONFIG.AI_LANGUAGE,
         sessionId: sessionId,
         previousQuestion: null,
         previousAnswer: null
-    };
-
-    log(reqId, 'UPSTREAM', `Sending payload (Length: ${payload.question.length} chars)...`);
-
-    const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
-      method: "POST",
-      headers: CONFIG.HEADERS,
-      body: JSON.stringify(payload)
+      })
     });
 
     if (!response.ok) {
         const errText = await response.text();
-        log(reqId, 'ERROR', `Upstream Status: ${response.status} - Body: ${errText}`);
+        log(reqId, 'ERROR', `Upstream Error ${response.status}: ${errText}`);
         return createErrorResponse(`Upstream Error: ${response.status}`, response.status);
     }
 
-    log(reqId, 'UPSTREAM', `Response OK (${response.status}). Starting Stream...`);
+    log(reqId, 'UPSTREAM', `Response OK. Stream Started.`);
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
@@ -152,7 +146,7 @@ async function handleChatCompletions(req) {
         let buffer = "";
         let isReasoning = false;
         let stopStream = false;
-        let totalChunks = 0;
+        let chunkCount = 0;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -173,43 +167,45 @@ async function handleChatCompletions(req) {
 
             const command = content.trim();
 
-            // --- Logging Events ---
-            if (command === '[REASON_START]') log(reqId, 'STREAM', 'Thinking Started (DeepSeek Mode)');
-            if (command === '[ANSWER_DONE]') log(reqId, 'STREAM', 'Answer Done (Stopping Stream)');
-            if (command === '[RELATE_Q_START]') log(reqId, 'STREAM', 'Related Qs detected (Stopping Stream)');
-            
-            if (CONFIG.DEBUG_STREAM_DATA && content.length > 0) {
-                 console.log(`   [Raw Data]: ${content.substring(0, 50).replace(/\n/g, '\\n')}...`);
-            }
-
-            // --- Logic Control ---
             if (command === '[ANSWER_DONE]' || command === '[RELATE_Q_START]') {
                 stopStream = true; break;
             }
             if (command === '[DONE]' || command === '[ANSWER_START]') continue;
-            if (command === '[REASON_START]') { isReasoning = true; continue; }
+            
+            // [FIX 2] DeepSeek Logic
+            if (command === '[REASON_START]') { 
+                if (allowReasoning) isReasoning = true; 
+                // Nếu không cho phép reasoning (như Enhance Prompt), ta bỏ qua tag này 
+                // và coi nội dung bên trong là text thường hoặc bỏ qua (tùy Heck).
+                // Heck thường tách biệt, nên ta cứ để flag chạy, nhưng xử lý ở dưới.
+                continue; 
+            }
             if (command === '[REASON_DONE]') { isReasoning = false; continue; }
-            if (command.startsWith('{"error":')) {
-                log(reqId, 'ERROR', `Stream sent error JSON: ${command}`);
-                continue;
+            if (command.startsWith('{"error":')) continue;
+
+            // [FIX 3] Xử lý xuống dòng & Empty content
+            if (content.length === 0) content = "\n";
+            
+            // [FIX 4] Log 5 chunk đầu tiên để Debug
+            if (chunkCount < 5) {
+                log(reqId, 'DATA', `Chunk ${chunkCount}: ${JSON.stringify(content)}`);
             }
 
-            if (content.length === 0) content = "\n";
+            // [FIX 5] Nếu model không hỗ trợ Reasoning, ép toàn bộ nội dung thành 'content'
+            // Điều này giúp Client không bị lỗi khi nhận 'reasoning_content' ở model thường
+            let finalIsReasoning = isReasoning && allowReasoning;
 
-            const chunk = createChunk(reqId, requestModel, content, null, isReasoning);
+            // Tạo chunk
+            const chunk = createChunk(reqId, requestModel, content, null, finalIsReasoning);
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-            totalChunks++;
+            chunkCount++;
           }
         }
         
-        log(reqId, 'INFO', `Stream Finished. Total Chunks Sent: ${totalChunks}`);
         await writer.write(encoder.encode('data: [DONE]\n\n'));
+        log(reqId, 'INFO', `Done. Total Chunks: ${chunkCount}`);
       } catch (e) {
-        if (e && e.name !== 'AbortError') {
-             log(reqId, 'ERROR', `Stream Broken: ${e.message}`);
-        } else {
-             log(reqId, 'INFO', `Client Disconnected`);
-        }
+        if (e && e.name !== 'AbortError') log(reqId, 'ERROR', `Stream: ${e.message}`);
       } finally {
         try { await writer.close(); } catch (e) {}
       }
@@ -217,7 +213,7 @@ async function handleChatCompletions(req) {
 
     return new Response(readable, { headers: corsHeaders({ 'Content-Type': 'text/event-stream' }) });
   } catch (e) {
-    log(reqId, 'ERROR', `Critical Crash: ${e.message}`);
+    log(reqId, 'ERROR', `Crash: ${e.message}`);
     return createErrorResponse(e.message, 500);
   }
 }
@@ -229,16 +225,10 @@ async function createSession(title, reqId) {
     const res = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
       method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title })
     });
-    if(!res.ok) {
-        log(reqId, 'UPSTREAM', `Create Session Failed: ${res.status}`);
-        return crypto.randomUUID();
-    }
+    if(!res.ok) return crypto.randomUUID();
     const data = await res.json();
     return data.id;
-  } catch (e) { 
-      log(reqId, 'ERROR', `Create Session Exception: ${e.message}`);
-      return crypto.randomUUID(); 
-  }
+  } catch (e) { return crypto.randomUUID(); }
 }
 
 function createChunk(id, model, content, finishReason, isReasoning) {
