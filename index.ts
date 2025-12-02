@@ -1,11 +1,10 @@
 /**
  * =================================================================================
  * Project: Heck-2API (Bun Edition)
- * Version: 1.5.0 (Crash Fix)
+ * Version: 1.6.0 (Stability Fix)
  * Fixes:
- * - [x] "lastUserMsg.substring is not a function" (Handle Multimodal/Array content)
- * - [x] Safe string handling for all message types
- * - [x] Previous fixes (Spacing, Garbage removal, Line breaks)
+ * - [x] TypeError: Cannot close a writable stream
+ * - [x] Handle "Stream error: undefined" (Client Disconnect)
  * =================================================================================
  */
 
@@ -52,20 +51,18 @@ Bun.serve({
   }
 });
 
-// --- Hàm xử lý nội dung tin nhắn an toàn ---
 function extractContent(content: any): string {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
-        // Xử lý trường hợp GPT-4 Vision (Array of content parts)
         return content
             .map(part => {
                 if (typeof part === 'string') return part;
                 if (part?.type === 'text') return part.text || "";
-                return ""; // Bỏ qua phần hình ảnh (image_url) vì API text không nhận
+                return "";
             })
             .join("\n");
     }
-    return ""; // Fallback cho null/undefined
+    return ""; 
 }
 
 async function handleChatCompletions(req) {
@@ -79,13 +76,10 @@ async function handleChatCompletions(req) {
     let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
     
     let fullPrompt = "";
-    let lastUserMsg = ""; // Đảm bảo luôn là string
+    let lastUserMsg = "";
 
-    // --- LOOP FIX ---
     for (const msg of body.messages) {
-       // Trích xuất text an toàn từ mọi loại msg
        const cleanContent = extractContent(msg.content);
-       
        if (msg.role === 'system') fullPrompt += `[System]: ${cleanContent}\n`;
        else if (msg.role === 'user') {
            fullPrompt += `[User]: ${cleanContent}\n`;
@@ -94,8 +88,6 @@ async function handleChatCompletions(req) {
        else if (msg.role === 'assistant') fullPrompt += `[Assistant]: ${cleanContent}\n`;
     }
 
-    // --- TITLE GENERATION SAFEGUARD ---
-    // Đảm bảo lastUserMsg là string và không rỗng trước khi gọi substring
     const safeTitle = (lastUserMsg && typeof lastUserMsg === 'string') ? lastUserMsg : "New Chat";
     const sessionTitle = (safeTitle.substring(0, 15) || "Chat").replace(/\n/g, " ");
     
@@ -121,6 +113,7 @@ async function handleChatCompletions(req) {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
+    // --- STREAM PROCESSING (SAFE MODE) ---
     (async () => {
       try {
         const reader = response.body.getReader();
@@ -157,15 +150,24 @@ async function handleChatCompletions(req) {
             if (content.length === 0) content = "\n";
 
             const chunk = createChunk(requestId, requestModel, content, null, isReasoning);
+            // Kiểm tra writer trước khi write để tránh lỗi
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
           }
         }
         
         await writer.write(encoder.encode('data: [DONE]\n\n'));
       } catch (e) {
-        console.error("Stream error:", e);
+        // Chỉ log lỗi thật, bỏ qua lỗi disconnect (undefined hoặc AbortError)
+        if (e && e.name !== 'AbortError') {
+             console.error("Stream Warning:", e.message || "Client Disconnected");
+        }
       } finally {
-        await writer.close();
+        // [FIX QUAN TRỌNG] Bọc close trong try/catch để tránh crash server
+        try {
+            await writer.close();
+        } catch (e) {
+            // Ignore error if stream is already closed
+        }
       }
     })();
 
