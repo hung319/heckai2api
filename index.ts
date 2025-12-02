@@ -1,11 +1,12 @@
 /**
  * =================================================================================
  * Project: Heck-2API (Bun Edition)
- * Version: 1.8.0 (Enhance Prompt Fix)
- * Fixes:
- * - [x] Disable Reasoning for non-R1 models (Fixes Client Parse Error)
- * - [x] Log raw content of first chunks to debug "Enhance" issues
- * - [x] Remove leading newlines (Fixes Prompt format)
+ * Version: 2.1.0 (Strict OpenAI Standard)
+ * Based on: v1.6.0
+ * Changes:
+ * - Added explicit 'finish_reason: stop' chunk (Required by OpenAI Spec)
+ * - Added JSON unescaping for cleaner content
+ * - Added Strict Headers (Cache-Control)
  * =================================================================================
  */
 
@@ -15,7 +16,6 @@ const CONFIG = {
   UPSTREAM_API_BASE: process.env.UPSTREAM_API_BASE || "https://api.heckai.weight-wave.com/api/ha/v1",
   AI_LANGUAGE: process.env.AI_LANGUAGE || "Vietnamese",
   
-  // Headers
   HEADERS: {
     "Host": "api.heckai.weight-wave.com",
     "Origin": "https://heck.ai",
@@ -40,20 +40,7 @@ const CONFIG = {
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
 
-// --- Logger ---
-function log(id: string, type: string, msg: string) {
-    const time = new Date().toLocaleTimeString();
-    let color = "\x1b[37m"; 
-    if (type === 'INFO') color = "\x1b[36m";
-    if (type === 'UPSTREAM') color = "\x1b[33m"; 
-    if (type === 'STREAM') color = "\x1b[32m"; 
-    if (type === 'ERROR') color = "\x1b[31m";
-    if (type === 'DATA') color = "\x1b[90m"; // Grey for raw data
-
-    console.log(`\x1b[90m[${time}]\x1b[0m \x1b[35m[${id}]\x1b[0m ${color}[${type}]\x1b[0m ${msg}`);
-}
-
-console.log(`🚀 Heck-2API (v1.8.0) running on port ${CONFIG.PORT}`);
+console.log(`🚀 Heck-2API (Standard Mode) running on port ${CONFIG.PORT}`);
 
 Bun.serve({
   port: CONFIG.PORT,
@@ -66,53 +53,49 @@ Bun.serve({
   }
 });
 
+// Helper: Xử lý nội dung (String hoặc Array cho Vision)
 function extractContent(content: any): string {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
-        return content.map(part => (typeof part === 'string' ? part : (part?.text || ""))).join("\n");
+        return content
+            .map(part => {
+                if (typeof part === 'string') return part;
+                if (part?.type === 'text') return part.text || "";
+                return "";
+            })
+            .join("\n");
     }
     return ""; 
 }
 
 async function handleChatCompletions(req) {
-  const reqId = `req-${Math.floor(Math.random() * 10000)}`;
-  
-  if (!verifyAuth(req)) {
-      log(reqId, 'ERROR', 'Auth Failed');
-      return createErrorResponse("Unauthorized", 401);
-  }
+  if (!verifyAuth(req)) return createErrorResponse("Unauthorized", 401);
 
+  const requestId = `chatcmpl-${crypto.randomUUID()}`;
+  
   try {
     const body = await req.json();
     let requestModel = body.model || CONFIG.DEFAULT_MODEL;
     let upstreamModel = CONFIG.MODEL_MAP[requestModel] || requestModel;
     
-    // [FIX 1] Chỉ cho phép Reasoning nếu model là dòng R1 hoặc Thinking
+    // Logic Reasoning (Chỉ bật cho dòng model hỗ trợ suy nghĩ)
     const allowReasoning = requestModel.includes('r1') || requestModel.includes('think') || requestModel.includes('o1');
-
-    log(reqId, 'INFO', `Request: ${requestModel} (Reasoning Allowed: ${allowReasoning})`);
 
     let fullPrompt = "";
     let lastUserMsg = "";
 
+    // Prompt Builder: Dùng \n\n thay vì [Tag] để tránh làm rối model
     for (const msg of body.messages) {
        const cleanContent = extractContent(msg.content);
-       if (msg.role === 'system') fullPrompt += `[System]: ${cleanContent}\n`;
-       else if (msg.role === 'user') {
-           fullPrompt += `[User]: ${cleanContent}\n`;
-           lastUserMsg = cleanContent;
-       }
-       else if (msg.role === 'assistant') fullPrompt += `[Assistant]: ${cleanContent}\n`;
+       if (!cleanContent) continue;
+       fullPrompt += `${cleanContent}\n\n`;
+       if (msg.role === 'user') lastUserMsg = cleanContent;
     }
 
-    const safeTitle = (lastUserMsg && typeof lastUserMsg === 'string') ? lastUserMsg : "New Chat";
-    const sessionTitle = (safeTitle.substring(0, 15) || "Chat").replace(/\n/g, " ");
+    const safeTitle = (lastUserMsg && typeof lastUserMsg === 'string') ? lastUserMsg : "Chat";
+    const sessionTitle = (safeTitle.substring(0, 15) || "New Chat").replace(/\n/g, " ");
     
-    const sessionId = await createSession(sessionTitle, reqId);
-    
-    // [DEBUG] Log prompt ngắn gọn để biết user đang gửi gì
-    const shortPrompt = fullPrompt.length > 50 ? fullPrompt.substring(0, 50) + "..." : fullPrompt;
-    log(reqId, 'INFO', `Prompt Start: "${shortPrompt.replace(/\n/g, ' ')}"`);
+    const sessionId = await createSession(sessionTitle);
 
     const response = await fetch(`${CONFIG.UPSTREAM_API_BASE}/chat`, {
       method: "POST",
@@ -127,13 +110,14 @@ async function handleChatCompletions(req) {
       })
     });
 
-    if (!response.ok) {
-        const errText = await response.text();
-        log(reqId, 'ERROR', `Upstream Error ${response.status}: ${errText}`);
-        return createErrorResponse(`Upstream Error: ${response.status}`, response.status);
-    }
+    if (!response.ok) return createErrorResponse(`Upstream Error: ${response.status}`, response.status);
 
-    log(reqId, 'UPSTREAM', `Response OK. Stream Started.`);
+    // Headers chuẩn cho Streaming (Quan trọng cho VSCode/Kilo)
+    const streamHeaders = corsHeaders({
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive'
+    });
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
@@ -146,7 +130,6 @@ async function handleChatCompletions(req) {
         let buffer = "";
         let isReasoning = false;
         let stopStream = false;
-        let chunkCount = 0;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -160,67 +143,73 @@ async function handleChatCompletions(req) {
             let cleanLine = line.endsWith('\r') ? line.slice(0, -1) : line;
             if (!cleanLine.startsWith('data:')) continue;
             
-            let temp = cleanLine.slice(5); 
-            let content = "";
-            if (temp.startsWith(' ')) content = temp.slice(1);
-            else content = temp;
+            // Cắt "data:" và khoảng trắng
+            let rawData = cleanLine.slice(5); 
+            if (rawData.startsWith(' ')) rawData = rawData.slice(1);
 
-            const command = content.trim();
+            const command = rawData.trim();
 
+            // Xử lý các tín hiệu dừng
             if (command === '[ANSWER_DONE]' || command === '[RELATE_Q_START]') {
                 stopStream = true; break;
             }
             if (command === '[DONE]' || command === '[ANSWER_START]') continue;
             
-            // [FIX 2] DeepSeek Logic
+            // Xử lý DeepSeek Reasoning
             if (command === '[REASON_START]') { 
                 if (allowReasoning) isReasoning = true; 
-                // Nếu không cho phép reasoning (như Enhance Prompt), ta bỏ qua tag này 
-                // và coi nội dung bên trong là text thường hoặc bỏ qua (tùy Heck).
-                // Heck thường tách biệt, nên ta cứ để flag chạy, nhưng xử lý ở dưới.
                 continue; 
             }
             if (command === '[REASON_DONE]') { isReasoning = false; continue; }
             if (command.startsWith('{"error":')) continue;
 
-            // [FIX 3] Xử lý xuống dòng & Empty content
-            if (content.length === 0) content = "\n";
+            // --- CHUẨN HÓA NỘI DUNG (Strict Standard) ---
+            let finalContent = rawData;
             
-            // [FIX 4] Log 5 chunk đầu tiên để Debug
-            if (chunkCount < 5) {
-                log(reqId, 'DATA', `Chunk ${chunkCount}: ${JSON.stringify(content)}`);
-            }
+            // 1. Unescape JSON String (Heck trả "Hello" -> Hello)
+            try {
+                if (rawData.startsWith('"') && rawData.endsWith('"')) {
+                    const parsed = JSON.parse(rawData);
+                    if (typeof parsed === 'string') finalContent = parsed;
+                }
+            } catch (e) {}
 
-            // [FIX 5] Nếu model không hỗ trợ Reasoning, ép toàn bộ nội dung thành 'content'
-            // Điều này giúp Client không bị lỗi khi nhận 'reasoning_content' ở model thường
+            // 2. Handle Empty Content (Newline)
+            if (finalContent.length === 0) finalContent = "\n";
+
+            // 3. Gửi Chunk Dữ Liệu (finish_reason luôn là null khi đang stream)
             let finalIsReasoning = isReasoning && allowReasoning;
-
-            // Tạo chunk
-            const chunk = createChunk(reqId, requestModel, content, null, finalIsReasoning);
+            const chunk = createChunk(requestId, requestModel, finalContent, null, finalIsReasoning);
+            
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-            chunkCount++;
           }
         }
         
+        // --- QUAN TRỌNG: STOP CHUNK ---
+        // Chuẩn OpenAI bắt buộc gửi chunk cuối cùng với finish_reason="stop"
+        const stopChunk = createChunk(requestId, requestModel, "", "stop", false);
+        await writer.write(encoder.encode(`data: ${JSON.stringify(stopChunk)}\n\n`));
+        
+        // Kết thúc stream
         await writer.write(encoder.encode('data: [DONE]\n\n'));
-        log(reqId, 'INFO', `Done. Total Chunks: ${chunkCount}`);
+        
       } catch (e) {
-        if (e && e.name !== 'AbortError') log(reqId, 'ERROR', `Stream: ${e.message}`);
+        if (e && e.name !== 'AbortError') console.error("Stream Warning:", e.message);
       } finally {
         try { await writer.close(); } catch (e) {}
       }
     })();
 
-    return new Response(readable, { headers: corsHeaders({ 'Content-Type': 'text/event-stream' }) });
+    return new Response(readable, { headers: streamHeaders });
   } catch (e) {
-    log(reqId, 'ERROR', `Crash: ${e.message}`);
+    console.error("Critical Error:", e);
     return createErrorResponse(e.message, 500);
   }
 }
 
 // --- Helpers ---
 
-async function createSession(title, reqId) {
+async function createSession(title) {
   try {
     const res = await fetch(`${CONFIG.UPSTREAM_API_BASE}/session/create`, {
       method: "POST", headers: CONFIG.HEADERS, body: JSON.stringify({ title })
@@ -232,20 +221,27 @@ async function createSession(title, reqId) {
 }
 
 function createChunk(id, model, content, finishReason, isReasoning) {
+  // Nếu là Chunk kết thúc (Stop)
+  if (finishReason === "stop") {
+      return {
+        id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+      };
+  }
+
+  // Nếu là Chunk dữ liệu (Streaming)
   const delta = isReasoning ? { reasoning_content: content } : { content: content };
   return {
     id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }]
+    choices: [{ index: 0, delta, finish_reason: null }] // Quan trọng: finish_reason phải là null
   };
 }
 
 function handleModels(req) {
-    return new Response(JSON.stringify({ 
-        object: "list", 
-        data: Object.keys(CONFIG.MODEL_MAP).map(id => ({
-            id, object: "model", created: Date.now(), owned_by: "heck-ai"
-        })) 
-    }), { headers: corsHeaders() });
+    const models = Object.keys(CONFIG.MODEL_MAP).map(id => ({
+        id, object: "model", created: Date.now(), owned_by: "heck-ai"
+    }));
+    return new Response(JSON.stringify({ object: "list", data: models }), { headers: corsHeaders() });
 }
 
 function verifyAuth(req) {
@@ -260,8 +256,9 @@ function createErrorResponse(msg, code) {
   });
 }
 
-function corsHeaders() {
+function corsHeaders(extra = {}) {
   return {
+    ...extra,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': '*',
     'Access-Control-Allow-Headers': '*'
